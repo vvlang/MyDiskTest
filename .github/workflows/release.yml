@@ -1,0 +1,166 @@
+name: Build & Publish Releases (Windows & macOS)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            arch_name: macos-arm64
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            arch_name: macos-x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests (host arch)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: cargo test
+
+      - name: Build macOS release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package signed MyDiskTest.app and ZIP
+        run: |
+          STAGE_DIR="$(mktemp -d)"
+          APP_DIR="${STAGE_DIR}/MyDiskTest.app"
+          mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/mydisktest" "${APP_DIR}/Contents/MacOS/MyDiskTest"
+          chmod 755 "${APP_DIR}/Contents/MacOS/MyDiskTest"
+          cat > "${APP_DIR}/Contents/Info.plist" << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key>
+              <string>zh_CN</string>
+              <key>CFBundleExecutable</key>
+              <string>MyDiskTest</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.mydisktest.next</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>MyDiskTest</string>
+              <key>CFBundleDisplayName</key>
+              <string>MyDiskTest Next</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.1.0</string>
+              <key>CFBundleVersion</key>
+              <string>2</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>12.0</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>NSRemovableVolumesUsageDescription</key>
+              <string>MyDiskTest 需要访问可移动存储设备以进行扩容检测、坏块扫描、错误扫描和读写速度基准测试。</string>
+          </dict>
+          </plist>
+          EOF
+          codesign --force --deep --sign - "${APP_DIR}"
+          chmod 755 "${APP_DIR}/Contents/MacOS/MyDiskTest"
+          codesign --verify --deep --strict "${APP_DIR}"
+          ditto -c -k --sequesterRsrc --keepParent "${APP_DIR}" "MyDiskTest-${{ matrix.arch_name }}.zip"
+          rm -rf "${STAGE_DIR}"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyDiskTest-${{ matrix.arch_name }}
+          path: MyDiskTest-${{ matrix.arch_name }}.zip
+
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch_name: windows-x64
+          - target: aarch64-pc-windows-msvc
+            arch_name: windows-arm64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests (x64 host)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo test
+
+      - name: Build Windows release executable
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare Windows release artifact
+        shell: pwsh
+        run: |
+          Copy-Item "target\${{ matrix.target }}\release\mydisktest.exe" "MyDiskTest-${{ matrix.arch_name }}.exe" -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyDiskTest-${{ matrix.arch_name }}
+          path: MyDiskTest-${{ matrix.arch_name }}.exe
+
+  publish-release:
+    needs: [build-macos, build-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lh release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          name: MyDiskTest Next ${{ github.ref_name }}
+          body: |
+            ## MyDiskTest Next ${{ github.ref_name }}
+
+            跨平台原生 Rust 高性能磁盘扩容检测、HD Tune Pro 风格错误扫描与性能基准测试工具（零依赖单文件分发）。
+
+            ### 下载说明
+            - **macOS (Apple Silicon M1/M2/M3/M4)**: `MyDiskTest-macos-arm64.zip`
+            - **macOS (Intel)**: `MyDiskTest-macos-x64.zip`
+            - **Windows 10/11 (64 位 x64)**: `MyDiskTest-windows-x64.exe`
+            - **Windows 11 (ARM64)**: `MyDiskTest-windows-arm64.exe`
+
+            > **macOS 首次使用提示**：解压后拖入「应用程序 (`/Applications`)」打开；如需使用底层极速 LBA 探针或 HD Tune Pro 物理表面错误扫描，请在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」中添加并开启 `MyDiskTest.app`。
+          files: release-assets/*
