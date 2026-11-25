@@ -1,6 +1,18 @@
-# MyDiskTest Next
+<p align="center">
+  <img src="assets/icon_256.png" width="96" height="96" alt="MyDiskTest Next Icon" />
+</p>
 
-> 专为最新 **Windows 11 (x64 / ARM64)** 与 **macOS (Apple Silicon / Intel)** 打造的跨平台原生存储扩容检测、坏块扫描与性能基准测试工具——经典 MyDiskTest 的现代化重制与增强版。
+<h1 align="center">MyDiskTest Next</h1>
+
+<p align="center">
+  专为最新 <strong>Windows 11 (x64 / ARM64)</strong> 与 <strong>macOS (Apple Silicon / Intel)</strong> 打造的跨平台原生存储扩容检测、HD Tune Pro 风格错误扫描与性能基准测试工具
+</p>
+
+<p align="center">
+  <img src="assets/banner.png" width="100%" alt="MyDiskTest Next Banner" />
+</p>
+
+> 📦 **直接下载成品**：前往 [GitHub Releases](https://github.com/vvlang/MyDiskTest/releases/latest) 下载 Windows 单文件 `.exe` 或 macOS 原生 `.app` 压缩包（零依赖、开箱即用）。
 
 ## ✨ 核心功能
 

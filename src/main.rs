@@ -18,11 +18,17 @@ fn main() -> eframe::Result<()> {
         std::process::exit(code);
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("MyDiskTest Next — 跨平台磁盘扩容与性能检测工具")
+        .with_inner_size([1180.0, 780.0])
+        .with_min_inner_size([920.0, 620.0]);
+
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon_256.png")) {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("MyDiskTest Next — 跨平台磁盘扩容与性能检测工具")
-            .with_inner_size([1180.0, 780.0])
-            .with_min_inner_size([920.0, 620.0]),
+        viewport,
         ..Default::default()
     };
 

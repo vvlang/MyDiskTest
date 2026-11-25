@@ -19,6 +19,8 @@ pub struct MyDiskTestApp {
     /// Active or most recently completed test snapshot
     active_state: Option<Arc<Mutex<LiveTestSnapshot>>>,
     cancel_flag: Option<Arc<AtomicBool>>,
+    /// Embedded app logo texture for the header bar
+    logo_texture: Option<egui::TextureHandle>,
     /// Brief toast/status message (e.g., report saved confirmation)
     toast: Option<String>,
 }
@@ -27,6 +29,21 @@ impl MyDiskTestApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::fonts::configure_cjk_fonts(&cc.egui_ctx);
         apply_visuals(&cc.egui_ctx, true);
+
+        let logo_texture =
+            eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon_256.png"))
+                .ok()
+                .map(|icon| {
+                    let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                        [icon.width as usize, icon.height as usize],
+                        &icon.rgba,
+                    );
+                    cc.egui_ctx.load_texture(
+                        "app_logo",
+                        color_img,
+                        egui::TextureOptions::LINEAR,
+                    )
+                });
 
         let disks = scan_disks();
         // Auto-select first external/removable disk if present, otherwise first disk
@@ -43,6 +60,7 @@ impl MyDiskTestApp {
             config: TestConfig::default(),
             active_state: None,
             cancel_flag: None,
+            logo_texture,
             toast: None,
         }
     }
@@ -165,14 +183,21 @@ impl eframe::App for MyDiskTestApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    if let Some(ref tex) = self.logo_texture {
+                        ui.add(
+                            egui::Image::new(tex)
+                                .fit_to_exact_size(egui::vec2(26.0, 26.0))
+                                .corner_radius(CornerRadius::same(6)),
+                        );
+                    }
                     ui.label(
-                        RichText::new("💾 MyDiskTest Next")
+                        RichText::new("MyDiskTest Next")
                             .strong()
                             .size(18.0)
                             .color(Color32::from_rgb(56, 189, 248)),
                     );
                     ui.label(
-                        RichText::new("v1.1  •  扩容检测 / 坏块扫描 / HD Tune 错误扫描 / 速度基准 / 老化拷机")
+                        RichText::new("v1.1.1  •  扩容检测 / 坏块扫描 / HD Tune 错误扫描 / 速度基准 / 老化拷机")
                             .weak()
                             .small(),
                     );

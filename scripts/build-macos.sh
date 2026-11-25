@@ -22,6 +22,9 @@ mkdir -p "${STAGE_APP}/Contents/Resources"
 
 cp "${ROOT_DIR}/target/release/mydisktest" "${STAGE_APP}/Contents/MacOS/${APP_NAME}"
 chmod 755 "${STAGE_APP}/Contents/MacOS/${APP_NAME}"
+if [[ -f "${ROOT_DIR}/assets/AppIcon.icns" ]]; then
+    cp "${ROOT_DIR}/assets/AppIcon.icns" "${STAGE_APP}/Contents/Resources/AppIcon.icns"
+fi
 
 cat > "${STAGE_APP}/Contents/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -32,6 +35,8 @@ cat > "${STAGE_APP}/Contents/Info.plist" << 'EOF'
     <string>zh_CN</string>
     <key>CFBundleExecutable</key>
     <string>MyDiskTest</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.mydisktest.next</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -43,9 +48,9 @@ cat > "${STAGE_APP}/Contents/Info.plist" << 'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>1.1.1</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>3</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>NSHighResolutionCapable</key>
