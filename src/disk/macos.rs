@@ -202,9 +202,10 @@ fn inspect_mount_macos(
         DriveKind::InternalHdd
     };
 
-    // Match USB hardware info (VID/PID/Manufacturer/Serial/Speed) via whole-disk BSD name (e.g. "disk4")
+    // Match USB hardware info (VID/PID/Manufacturer/Serial/Speed) via physical whole-disk BSD name (e.g. "disk4")
     let usb_hw = usb_map
-        .get(&part_of_whole)
+        .get(&physical_whole_disk)
+        .or_else(|| usb_map.get(&part_of_whole))
         .or_else(|| usb_map.get(device_id.trim_start_matches("/dev/")))
         .or_else(|| {
             // Fallback: match by media name substring
@@ -278,28 +279,171 @@ fn extract_bytes_in_parens(s: &str) -> Option<u64> {
     rest[..end].trim().parse::<u64>().ok()
 }
 
-/// Queries `system_profiler SPUSBDataType -json` once to build a lookup from BSD disk name -> USB VID/PID/speed.
+/// Builds a lookup from BSD disk name (e.g. "disk4", "disk4s1") -> USB VID/PID/bcdDevice/speed.
+///
+/// Primary source: `ioreg -r -c IOUSBHostDevice -l -w 0` (works on ALL macOS 12..27+ versions,
+/// including Apple Silicon USB3/USB4 hubs, UASP enclosures, and macOS 26/27 where Apple emptied
+/// legacy `SPUSBDataType`).
+/// Secondary fallback: `system_profiler SPUSBDataType -json` and `SPUSBHostDataType -json`.
 fn query_usb_hardware_map() -> HashMap<String, UsbHardwareInfo> {
     let mut map = HashMap::new();
-    let output = match Command::new("system_profiler")
+
+    if let Ok(output) = Command::new("ioreg")
+        .args(["-r", "-c", "IOUSBHostDevice", "-l", "-w", "0"])
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            parse_ioreg_usb_tree(&text, &mut map);
+        }
+    }
+
+    // Legacy fallback for older macOS where SPUSBDataType still includes `Media` nodes
+    if let Ok(output) = Command::new("system_profiler")
         .args(["SPUSBDataType", "-json"])
         .output()
     {
-        Ok(o) if o.status.success() => o,
-        _ => return map,
-    };
-
-    let json: Value = match serde_json::from_slice(&output.stdout) {
-        Ok(v) => v,
-        Err(_) => return map,
-    };
-
-    if let Some(buses) = json.get("SPUSBDataType").and_then(|v| v.as_array()) {
-        for bus in buses {
-            walk_usb_tree(bus, &mut map);
+        if output.status.success() {
+            if let Ok(json) = serde_json::from_slice::<Value>(&output.stdout) {
+                if let Some(buses) = json.get("SPUSBDataType").and_then(|v| v.as_array()) {
+                    for bus in buses {
+                        walk_usb_tree(bus, &mut map);
+                    }
+                }
+            }
         }
     }
+
     map
+}
+
+/// Parses `ioreg -r -c IOUSBHostDevice -l -w 0` output by maintaining a nesting stack of
+/// `IOUSBHostDevice` ancestors so every descendant `IOMedia` `"BSD Name" = "diskN"` maps
+/// precisely to its immediate parent USB device (never a parent hub).
+fn parse_ioreg_usb_tree(text: &str, map: &mut HashMap<String, UsbHardwareInfo>) {
+    let mut stack: Vec<(usize, UsbHardwareInfo)> = Vec::new();
+    let mut in_usb_device_props = false;
+
+    for line in text.lines() {
+        if let Some(node_pos) = line.find("+-o ") {
+            // Pop any IOUSBHostDevice ancestors at same or deeper indent
+            while let Some(&(top_indent, _)) = stack.last() {
+                if top_indent >= node_pos {
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
+
+            if line.contains("<class IOUSBHostDevice,") {
+                let name_raw = &line[node_pos + 4..];
+                let clean_name = name_raw
+                    .split('@')
+                    .next()
+                    .unwrap_or(name_raw)
+                    .split("<class")
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let mut hw = UsbHardwareInfo::default();
+                if !clean_name.is_empty() {
+                    hw.product_name = Some(clean_name);
+                }
+                stack.push((node_pos, hw));
+                in_usb_device_props = true;
+            } else {
+                in_usb_device_props = false;
+            }
+            continue;
+        }
+
+        let Some((_, cur_hw)) = stack.last_mut() else {
+            continue;
+        };
+
+        let trimmed = line.trim_start_matches(|c: char| c == ' ' || c == '|');
+        if !trimmed.starts_with('"') {
+            continue;
+        }
+        let Some((k_part, v_part)) = trimmed.split_once(" = ") else {
+            continue;
+        };
+        let key = k_part.trim().trim_matches('"');
+        let val = v_part.trim();
+
+        match key {
+            "BSD Name" => {
+                let bsd = val.trim_matches('"').trim();
+                if bsd.starts_with("disk") && cur_hw.vid.is_some() {
+                    map.insert(bsd.to_string(), cur_hw.clone());
+                }
+            }
+            "idVendor" if in_usb_device_props || cur_hw.vid.is_none() => {
+                if let Some(n) = parse_u64_dec_or_hex(val) {
+                    cur_hw.vid = Some(format!("0x{:04X}", n));
+                }
+            }
+            "idProduct" if in_usb_device_props || cur_hw.pid.is_none() => {
+                if let Some(n) = parse_u64_dec_or_hex(val) {
+                    cur_hw.pid = Some(format!("0x{:04X}", n));
+                }
+            }
+            "bcdDevice" if in_usb_device_props || cur_hw.bcd_device.is_none() => {
+                if let Some(n) = parse_u64_dec_or_hex(val) {
+                    let major = (n >> 8) & 0xFF;
+                    let minor = n & 0xFF;
+                    cur_hw.bcd_device = Some(format!("{:x}.{:02x}", major, minor));
+                }
+            }
+            "USB Vendor Name" if in_usb_device_props || cur_hw.manufacturer.is_none() => {
+                let s = val.trim_matches('"').trim();
+                if !s.is_empty() {
+                    cur_hw.manufacturer = Some(s.to_string());
+                }
+            }
+            "USB Product Name" if in_usb_device_props => {
+                let s = val.trim_matches('"').trim();
+                if !s.is_empty() {
+                    cur_hw.product_name = Some(s.to_string());
+                }
+            }
+            "USB Serial Number" if in_usb_device_props || cur_hw.serial.is_none() => {
+                let s = val.trim_matches('"').trim();
+                if !s.is_empty() && !s.eq_ignore_ascii_case("Not Provided") {
+                    cur_hw.serial = Some(s.to_string());
+                }
+            }
+            "USBSpeed" if in_usb_device_props || cur_hw.speed.is_none() => {
+                if let Some(n) = parse_u64_dec_or_hex(val) {
+                    cur_hw.speed = Some(humanize_ioreg_usb_speed(n));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn parse_u64_dec_or_hex(raw: &str) -> Option<u64> {
+    let s = raw.trim().trim_matches('"');
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+fn humanize_ioreg_usb_speed(speed_code: u64) -> String {
+    match speed_code {
+        0 | 1 => "USB 1.0 (1.5 Mbps)".to_string(),
+        2 => "USB 1.1 (12 Mbps)".to_string(),
+        3 => "USB 2.0 (480 Mbps)".to_string(),
+        4 => "USB 3.0 (5 Gbps)".to_string(),
+        5 => "USB 3.2 Gen 2 (10 Gbps)".to_string(),
+        6 => "USB 3.2 Gen 2x2 (20 Gbps)".to_string(),
+        7 => "USB4 (40 Gbps)".to_string(),
+        other => format!("USB (Speed {})", other),
+    }
 }
 
 fn walk_usb_tree(node: &Value, map: &mut HashMap<String, UsbHardwareInfo>) {
@@ -338,12 +482,12 @@ fn walk_usb_tree(node: &Value, map: &mut HashMap<String, UsbHardwareInfo>) {
     if let Some(media_list) = node.get("Media").and_then(|v| v.as_array()) {
         for m in media_list {
             if let Some(bsd) = m.get("bsd_name").and_then(|v| v.as_str()) {
-                map.insert(bsd.to_string(), hw.clone());
+                map.entry(bsd.to_string()).or_insert_with(|| hw.clone());
             }
             if let Some(vols) = m.get("volumes").and_then(|v| v.as_array()) {
                 for vol in vols {
                     if let Some(bsd) = vol.get("bsd_name").and_then(|v| v.as_str()) {
-                        map.insert(bsd.to_string(), hw.clone());
+                        map.entry(bsd.to_string()).or_insert_with(|| hw.clone());
                     }
                 }
             }
@@ -365,5 +509,62 @@ fn humanize_usb_speed(raw: &str) -> String {
         "full_speed" => "USB 1.1 (12 Mbps)".to_string(),
         "low_speed" => "USB 1.0 (1.5 Mbps)".to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ioreg_parser_maps_nested_usb_flash_drive_not_parent_hub() {
+        let sample = r#"
++-o USB3 Gen2 Hub@02200000  <class IOUSBHostDevice, id 0x100000a33, registered, matched, active>
+  |   "USB Vendor Name" = "Apple"
+  |   "USBSpeed" = 5
+  |   "idVendor" = 1452
+  |   "idProduct" = 32780
+  |   "bcdDevice" = 22037
+  +-o AppleUSB30Hub@02200000  <class AppleUSB30Hub, id 0x100000a3c>
+    +-o usb3-hub-port1@02210000  <class AppleUSB30HubPort, id 0x100000a3f>
+      +-o USB3.0 Hub@02210000  <class IOUSBHostDevice, id 0x1000dbe75>
+        |   "USB Vendor Name" = "VIA Labs, Inc."
+        |   "USBSpeed" = 4
+        |   "idVendor" = 8457
+        |   "idProduct" = 2067
+        |   "bcdDevice" = 36885
+        +-o AppleUSB30Hub@02210000  <class AppleUSB30Hub, id 0x1000dbe77>
+          +-o AppleUSB30HubPort@02211000  <class AppleUSB30HubPort, id 0x1000dbe7b>
+            +-o Flash Disk@02211000  <class IOUSBHostDevice, id 0x1000f0001>
+              |   "USB Vendor Name" = "General"
+              |   "USB Product Name" = "USB Flash Disk"
+              |   "USB Serial Number" = "AA0401270001"
+              |   "USBSpeed" = 4
+              |   "idVendor" = 2316
+              |   "idProduct" = 4096
+              |   "bcdDevice" = 4352
+              +-o IOUSBHostInterface@0  <class IOUSBHostInterface, id 0x1000f0002>
+                +-o IOUSBMassStorageDriver  <class IOUSBMassStorageDriver, id 0x1000f0003>
+                  +-o Generic Flash Disk Media  <class IOMedia, id 0x1000f0004>
+                    |   "BSD Name" = "disk4"
+                    +-o FDisk_partition_scheme  <class IOFDiskPartitionScheme, id 0x1000f0005>
+                      +-o DOS_FAT_32_Untitled_1@1  <class IOMedia, id 0x1000f0006>
+                        |   "BSD Name" = "disk4s1"
+"#;
+        let mut map = HashMap::new();
+        parse_ioreg_usb_tree(sample, &mut map);
+
+        let d4 = map.get("disk4").expect("disk4 mapped");
+        assert_eq!(d4.vid.as_deref(), Some("0x090C"));
+        assert_eq!(d4.pid.as_deref(), Some("0x1000"));
+        assert_eq!(d4.bcd_device.as_deref(), Some("11.00"));
+        assert_eq!(d4.manufacturer.as_deref(), Some("General"));
+        assert_eq!(d4.product_name.as_deref(), Some("USB Flash Disk"));
+        assert_eq!(d4.serial.as_deref(), Some("AA0401270001"));
+        assert_eq!(d4.speed.as_deref(), Some("USB 3.0 (5 Gbps)"));
+
+        let d4s1 = map.get("disk4s1").expect("disk4s1 mapped");
+        assert_eq!(d4s1.vid.as_deref(), Some("0x090C"));
+        assert_eq!(d4s1.pid.as_deref(), Some("0x1000"));
     }
 }
