@@ -389,6 +389,7 @@ pub fn nand_manufacturer_name(id: u8) -> &'static str {
 }
 
 /// Returns true if byte 0 is a recognized JEDEC NAND Flash manufacturer ID.
+#[allow(dead_code)]
 pub fn is_known_nand_vendor(id: u8) -> bool {
     matches!(
         id,

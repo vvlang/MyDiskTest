@@ -160,14 +160,10 @@ pub fn probe_disk_chip(disk: &DiskInfo, db: &ChipDatabase) -> ChipInspection {
 
 #[cfg(target_os = "windows")]
 fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipInspection) {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
     const IOCTL_SCSI_PASS_THROUGH_DIRECT: u32 = 0x0004D014;
@@ -204,28 +200,21 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         return;
     };
 
-    let wide: Vec<u16> = OsStr::new(&dev_path)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&dev_path)
+    {
+        Ok(f) => f,
+        Err(_) => {
+            insp.probe_status =
+                "未获取到设备 SCSI 穿透权限（请以管理员身份运行本软件以直读主控固件与闪存 Flash ID）。"
+                    .to_string();
+            return;
+        }
     };
-    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-        insp.probe_status =
-            "未获取到设备 SCSI 穿透权限（请以管理员身份运行本软件以直读主控固件与闪存 Flash ID）。"
-                .to_string();
-        return;
-    }
+    let handle = file.as_raw_handle();
 
     let send_cdb = |cdb: &[u8], out_len: usize| -> Option<Vec<u8>> {
         let mut data = vec![0u8; out_len];
@@ -373,10 +362,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     } else {
         insp.probe_status = "非可移动 USB 闪存设备，已跳过 U 盘主控私有指令探测。".to_string();
     }
-
-    unsafe {
-        CloseHandle(handle);
-    }
+    drop(file);
 }
 
 #[cfg(target_os = "windows")]
