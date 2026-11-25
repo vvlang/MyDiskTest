@@ -1,11 +1,14 @@
 pub mod block_map;
+pub mod chip_panel;
 pub mod results_panel;
 pub mod sidebar;
 pub mod speed_chart;
 
+use crate::chip::{probe_disk_chip, ChipDatabase, ChipInspection};
 use crate::disk::{disk_info_for_custom_path, scan_disks, DiskInfo};
 use crate::engine::report::{format_json_report, format_markdown_report};
 use crate::engine::{spawn_test, LiveTestSnapshot, TestConfig, TestMode};
+use chip_panel::{ChipPanelAction, ChipPanelState};
 use egui::{Color32, CornerRadius, RichText, Stroke};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,6 +19,11 @@ pub struct MyDiskTestApp {
     allow_system_disk: bool,
     dark_mode: bool,
     config: TestConfig,
+    /// When true, displays the ChipGenius-style Controller & NAND Flash inspection tab
+    chip_view_active: bool,
+    chip_db: ChipDatabase,
+    chip_inspection: Option<ChipInspection>,
+    chip_panel_state: ChipPanelState,
     /// Active or most recently completed test snapshot
     active_state: Option<Arc<Mutex<LiveTestSnapshot>>>,
     cancel_flag: Option<Arc<AtomicBool>>,
@@ -45,6 +53,7 @@ impl MyDiskTestApp {
                     )
                 });
 
+        let chip_db = ChipDatabase::load_default();
         let disks = scan_disks();
         // Auto-select first external/removable disk if present, otherwise first disk
         let selected_disk = disks
@@ -52,17 +61,32 @@ impl MyDiskTestApp {
             .position(|d| d.kind.is_external_or_removable() && !d.is_system)
             .or_else(|| if disks.is_empty() { None } else { Some(0) });
 
+        let chip_inspection = selected_disk
+            .and_then(|i| disks.get(i))
+            .map(|d| probe_disk_chip(d, &chip_db));
+
         Self {
             disks,
             selected_disk,
             allow_system_disk: false,
             dark_mode: true,
             config: TestConfig::default(),
+            chip_view_active: false,
+            chip_db,
+            chip_inspection,
+            chip_panel_state: ChipPanelState::default(),
             active_state: None,
             cancel_flag: None,
             logo_texture,
             toast: None,
         }
+    }
+
+    fn reprobe_selected_chip(&mut self) {
+        self.chip_inspection = self
+            .selected_disk
+            .and_then(|i| self.disks.get(i))
+            .map(|d| probe_disk_chip(d, &self.chip_db));
     }
 
     fn is_running(&self) -> bool {
@@ -94,6 +118,7 @@ impl MyDiskTestApp {
                     .position(|d| d.kind.is_external_or_removable() && !d.is_system)
             })
             .or_else(|| if self.disks.is_empty() { None } else { Some(0) });
+        self.reprobe_selected_chip();
         self.toast = Some(format!("已刷新，发现 {} 个挂载卷。", self.disks.len()));
     }
 
@@ -197,7 +222,7 @@ impl eframe::App for MyDiskTestApp {
                             .color(Color32::from_rgb(56, 189, 248)),
                     );
                     ui.label(
-                        RichText::new("v1.1.1  •  扩容检测 / 坏块扫描 / HD Tune 错误扫描 / 速度基准 / 老化拷机")
+                        RichText::new("v1.2.0  •  扩容检测 / 坏块扫描 / HD Tune 错误扫描 / 主控闪存 / 速度基准 / 老化拷机")
                             .weak()
                             .small(),
                     );
@@ -249,6 +274,7 @@ impl eframe::App for MyDiskTestApp {
                     ui,
                     &self.disks,
                     self.selected_disk,
+                    self.chip_inspection.as_ref(),
                     is_running,
                     &mut self.allow_system_disk,
                 ) {
@@ -256,6 +282,7 @@ impl eframe::App for MyDiskTestApp {
                     sidebar::SidebarAction::SelectDisk(idx) => {
                         self.selected_disk = Some(idx);
                         self.allow_system_disk = false;
+                        self.reprobe_selected_chip();
                     }
                     sidebar::SidebarAction::PickCustomFolder => {
                         if let Some(folder) = rfd::FileDialog::new()
@@ -265,6 +292,7 @@ impl eframe::App for MyDiskTestApp {
                             let custom = disk_info_for_custom_path(folder);
                             self.disks.insert(0, custom);
                             self.selected_disk = Some(0);
+                            self.reprobe_selected_chip();
                             self.toast = Some("已添加并选中自定义测试目录。".to_string());
                         }
                     }
@@ -282,6 +310,55 @@ impl eframe::App for MyDiskTestApp {
                 // 1. Mode Selector Bar
                 self.render_mode_tabs(ui, is_running);
                 ui.add_space(10.0);
+
+                if self.chip_view_active {
+                    let selected = self.selected_disk.and_then(|i| self.disks.get(i)).cloned();
+                    egui::ScrollArea::vertical()
+                        .id_salt("chip_panel_main_scroll")
+                        .show(ui, |ui| {
+                            match chip_panel::render_chip_panel(
+                                ui,
+                                selected.as_ref(),
+                                self.chip_inspection.as_ref(),
+                                &self.chip_db,
+                                &mut self.chip_panel_state,
+                            ) {
+                                ChipPanelAction::Reprobe => {
+                                    self.reprobe_selected_chip();
+                                    self.toast = Some("已完成主控与闪存重新探测。".to_string());
+                                }
+                                ChipPanelAction::ImportWdb => {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .set_title("选择新版 Chips.wdb 数据库文件")
+                                        .add_filter("ChipGenius Database", &["wdb"])
+                                        .pick_file()
+                                    {
+                                        match ChipDatabase::load_from_file(&path) {
+                                            Ok(new_db) => {
+                                                let msg = format!(
+                                                    "已加载新版 Chips.wdb（日期 {}，{} 主控 / {} 闪存）",
+                                                    new_db.db_date,
+                                                    new_db.controllers.len(),
+                                                    new_db.flashes.len()
+                                                );
+                                                self.chip_db = new_db;
+                                                self.reprobe_selected_chip();
+                                                self.toast = Some(msg);
+                                            }
+                                            Err(e) => {
+                                                self.toast = Some(e);
+                                            }
+                                        }
+                                    }
+                                }
+                                ChipPanelAction::CopiedReport => {
+                                    self.toast = Some("已复制 ChipGenius 格式主控闪存报告到剪贴板！".to_string());
+                                }
+                                ChipPanelAction::None => {}
+                            }
+                        });
+                    return;
+                }
 
                 // 2. Mode Options + Start/Stop Button
                 self.render_config_and_controls(ui, ctx, is_running);
@@ -386,19 +463,19 @@ impl MyDiskTestApp {
     fn render_mode_tabs(&mut self, ui: &mut egui::Ui, is_running: bool) {
         let modes = [
             (TestMode::QuickExpand, "⚡ 快速扩容"),
-            (TestMode::FullVerify, "🛡 全盘坏块校验"),
-            (TestMode::ErrorScan, "🔍 错误扫描 (HD Tune)"),
+            (TestMode::FullVerify, "🛡 全盘坏块"),
+            (TestMode::ErrorScan, "🔍 错误扫描"),
             (TestMode::Benchmark, "🚀 读写基准"),
             (TestMode::Aging, "🔥 老化拷机"),
         ];
 
-        ui.columns(5, |cols| {
+        ui.columns(6, |cols| {
             for (i, (mode, label)) in modes.iter().enumerate() {
-                let selected = self.config.mode == *mode;
+                let selected = !self.chip_view_active && self.config.mode == *mode;
                 let btn = egui::Button::new(
                     RichText::new(*label)
                         .strong()
-                        .size(13.0)
+                        .size(12.5)
                         .color(if selected {
                             Color32::WHITE
                         } else {
@@ -414,6 +491,7 @@ impl MyDiskTestApp {
                 .min_size(egui::vec2(cols[i].available_width(), 36.0));
 
                 if cols[i].add_enabled(!is_running, btn).clicked() {
+                    self.chip_view_active = false;
                     self.config.mode = *mode;
                     // Adjust sensible defaults when switching modes
                     match mode {
@@ -442,6 +520,31 @@ impl MyDiskTestApp {
                         }
                     }
                 }
+            }
+
+            // 6th Tab: USB Controller & NAND Flash Inspector (Chips.wdb)
+            let chip_selected = self.chip_view_active;
+            let chip_btn = egui::Button::new(
+                RichText::new("🔬 主控闪存")
+                    .strong()
+                    .size(12.5)
+                    .color(if chip_selected {
+                        Color32::WHITE
+                    } else {
+                        cols[5].visuals().text_color()
+                    }),
+            )
+            .fill(if chip_selected {
+                Color32::from_rgb(14, 116, 144)
+            } else {
+                cols[5].visuals().widgets.inactive.weak_bg_fill
+            })
+            .corner_radius(CornerRadius::same(8))
+            .min_size(egui::vec2(cols[5].available_width(), 36.0));
+
+            if cols[5].add_enabled(!is_running, chip_btn).clicked() {
+                self.chip_view_active = true;
+                self.reprobe_selected_chip();
             }
         });
     }

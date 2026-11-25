@@ -9,6 +9,7 @@ use std::process::Command;
 struct UsbHardwareInfo {
     vid: Option<String>,
     pid: Option<String>,
+    bcd_device: Option<String>,
     manufacturer: Option<String>,
     serial: Option<String>,
     speed: Option<String>,
@@ -263,6 +264,7 @@ fn inspect_mount_macos(
         model,
         vid: usb_hw.and_then(|h| h.vid.clone()),
         pid: usb_hw.and_then(|h| h.pid.clone()),
+        bcd_device: usb_hw.and_then(|h| h.bcd_device.clone()),
         serial: usb_hw.and_then(|h| h.serial.clone()),
         link_speed: usb_hw.and_then(|h| h.speed.clone()),
     })
@@ -310,6 +312,10 @@ fn walk_usb_tree(node: &Value, map: &mut HashMap<String, UsbHardwareInfo>) {
             .get("product_id")
             .and_then(|v| v.as_str())
             .map(|s| s.split_whitespace().next().unwrap_or(s).to_string()),
+        bcd_device: node
+            .get("bcd_device")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string()),
         manufacturer: node
             .get("manufacturer")
             .and_then(|v| v.as_str())

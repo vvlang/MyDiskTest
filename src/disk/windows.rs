@@ -35,6 +35,8 @@ struct WinDiskMeta {
     media_type: Option<String>,
     #[serde(rename = "PnpId")]
     pnp_id: Option<String>,
+    #[serde(rename = "FirmwareVersion")]
+    firmware_version: Option<String>,
     #[serde(rename = "DiskNumber")]
     disk_number: Option<u32>,
 }
@@ -161,6 +163,11 @@ pub fn scan_disks_windows() -> Vec<DiskInfo> {
             .and_then(|m| m.disk_number)
             .map(|n| format!(r"\\.\PhysicalDrive{}", n));
 
+        let bcd_device = meta
+            .and_then(|m| m.firmware_version.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         results.push(DiskInfo {
             name: display_name,
             mount_point,
@@ -178,6 +185,7 @@ pub fn scan_disks_windows() -> Vec<DiskInfo> {
             model,
             vid,
             pid,
+            bcd_device,
             serial,
             link_speed: None,
         });
@@ -225,6 +233,7 @@ Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object {
         Size         = [uint64]$disk.Size
         MediaType    = if ($phys) { [string]$phys.MediaType } else { "" }
         PnpId        = if ($wmi) { [string]$wmi.PNPDeviceID } else { "" }
+        FirmwareVersion = if ($wmi) { [string]$wmi.FirmwareRevision } else { [string]$disk.FirmwareVersion }
     }
 }
 $out | ConvertTo-Json -Compress

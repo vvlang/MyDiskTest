@@ -75,6 +75,8 @@ pub struct DiskInfo {
     pub vid: Option<String>,
     /// USB Product ID (e.g. "0x5583")
     pub pid: Option<String>,
+    /// USB bcdDevice / firmware revision (e.g. "1.00", "11.00")
+    pub bcd_device: Option<String>,
     /// Serial number if available
     pub serial: Option<String>,
     /// USB link speed description if available
@@ -147,6 +149,7 @@ fn scan_disks_platform() -> Vec<DiskInfo> {
         model: String::new(),
         vid: None,
         pid: None,
+        bcd_device: None,
         serial: None,
         link_speed: None,
     }]
@@ -178,6 +181,7 @@ pub fn disk_info_for_custom_path(path: PathBuf) -> DiskInfo {
         model: path.display().to_string(),
         vid: None,
         pid: None,
+        bcd_device: None,
         serial: None,
         link_speed: None,
     }

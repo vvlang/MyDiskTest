@@ -1,3 +1,4 @@
+use crate::chip::ChipInspection;
 use crate::disk::{format_bytes, format_bytes_decimal, DiskInfo, DriveKind};
 use egui::{Color32, CornerRadius, RichText, Stroke, Ui};
 
@@ -12,6 +13,7 @@ pub fn render_sidebar(
     ui: &mut Ui,
     disks: &[DiskInfo],
     selected_idx: Option<usize>,
+    chip_info: Option<&ChipInspection>,
     is_running: bool,
     allow_system_disk: &mut bool,
 ) -> SidebarAction {
@@ -179,6 +181,37 @@ pub fn render_sidebar(
                 }
                 if let (Some(ref vid), Some(ref pid)) = (&disk.vid, &disk.pid) {
                     kv_row(ui, "VID / PID", &format!("{} / {}", vid, pid));
+                }
+                if let Some(insp) = chip_info {
+                    if let Some(ref m) = insp.controller_match {
+                        let ctrl = insp
+                            .firmware_controller_hint
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(&m.primary.controller);
+                        let summary = if ctrl.is_empty() {
+                            m.primary.chip_vendor.clone()
+                        } else {
+                            format!("{} {}", m.primary.chip_vendor, ctrl)
+                        };
+                        ui.label(RichText::new("主控芯片").small().weak());
+                        ui.label(
+                            RichText::new(summary.trim())
+                                .small()
+                                .strong()
+                                .color(Color32::from_rgb(56, 189, 248)),
+                        );
+                        ui.end_row();
+                    }
+                    if let Some(ref fr) = insp.flash_record {
+                        ui.label(RichText::new("闪存颗粒").small().weak());
+                        ui.label(
+                            RichText::new(format!("{} ({})", fr.manufacturer, fr.flash_type))
+                                .small()
+                                .color(Color32::from_rgb(52, 211, 153)),
+                        );
+                        ui.end_row();
+                    }
                 }
                 if let Some(ref sn) = disk.serial {
                     kv_row(ui, "序列号", sn);

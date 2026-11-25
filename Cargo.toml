@@ -1,6 +1,6 @@
 [package]
 name = "mydisktest"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2021"
 description = "Cross-platform modern MyDiskTest replacement for Windows and macOS — fake capacity detection, integrity verification, bad block scan, speed benchmark, and burn-in testing."
 license = "MIT"
@@ -17,6 +17,7 @@ chrono = { version = "0.4", features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.15"
+encoding_rs = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
