@@ -1,6 +1,6 @@
 [package]
 name = "mydisktest"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 description = "Cross-platform modern MyDiskTest replacement for Windows and macOS — fake capacity detection, integrity verification, bad block scan, speed benchmark, and burn-in testing."
 license = "MIT"
