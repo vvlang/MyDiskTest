@@ -322,6 +322,35 @@ pub fn render_chip_panel(
                             .color(Color32::from_rgb(148, 163, 184)),
                     );
 
+                    #[cfg(target_os = "windows")]
+                    if insp.needs_windows_admin {
+                        cols[1].add_space(6.0);
+                        let btn = egui::Button::new(
+                            RichText::new("🛡 以管理员身份重启（解锁底层闪存直读）")
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(Color32::from_rgb(37, 99, 235))
+                        .corner_radius(CornerRadius::same(6));
+                        if cols[1].add(btn).clicked() {
+                            if let Ok(exe) = std::env::current_exe() {
+                                use std::os::windows::process::CommandExt;
+                                let ps = format!(
+                                    "Start-Process -FilePath '{}' -Verb RunAs",
+                                    exe.display().to_string().replace('\'', "''")
+                                );
+                                if std::process::Command::new("powershell")
+                                    .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+                                    .creation_flags(0x08000000)
+                                    .spawn()
+                                    .is_ok()
+                                {
+                                    std::process::exit(0);
+                                }
+                            }
+                        }
+                    }
+
                     if !insp.probe_trace.is_empty() {
                         cols[1].add_space(6.0);
                         egui::CollapsingHeader::new("🔍 底层探测诊断明细")

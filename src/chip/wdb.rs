@@ -310,6 +310,20 @@ impl ChipDatabase {
             .cloned()
     }
 
+    /// Exact 4-byte binary Flash ID lookup (used to scan controller SCSI response payloads
+    /// with near-zero false positive rate: 1136 / 2^32 ≈ 0.000026%).
+    #[allow(dead_code)]
+    pub fn lookup_exact_4bytes(&self, bytes: &[u8]) -> Option<FlashRecord> {
+        if bytes.len() < 4 {
+            return None;
+        }
+        let key = format!(
+            "{:02X}{:02X}{:02X}{:02X}",
+            bytes[0], bytes[1], bytes[2], bytes[3]
+        );
+        self.by_flash_id.get(&key).map(|&idx| self.flashes[idx].clone())
+    }
+
     /// Interactive search across controllers by VID, PID, vendor, controller model, or note.
     pub fn search_controllers(&self, query: &str, limit: usize) -> Vec<&ControllerRecord> {
         let q = query.trim().to_ascii_lowercase();

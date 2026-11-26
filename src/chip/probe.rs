@@ -30,6 +30,8 @@ pub struct ChipInspection {
     pub probe_status: String,
     /// Diagnostic trace of every hardware probe step attempted
     pub probe_trace: Vec<String>,
+    /// True on Windows when opening the volume for SCSI pass-through failed due to missing admin rights
+    pub needs_windows_admin: bool,
 }
 
 impl ChipInspection {
@@ -131,7 +133,8 @@ impl ChipInspection {
 
 /// Performs USB controller & NAND flash inspection for the selected drive using:
 /// 1) `Chips.wdb` + expanded 2020-2026 controller VID/PID + SCSI Inquiry signature engine
-/// 2) On Windows: active read-only `IOCTL_SCSI_PASS_THROUGH_DIRECT` multi-controller firmware & Flash ID probing
+/// 2) On Windows: active read-only `IOCTL_SCSI_PASS_THROUGH_DIRECT` + `IOCTL_SCSI_PASS_THROUGH`
+///    implementing all 10 ChipGenius controller family CDB suites
 /// 3) On macOS: live IOKit `IOUSBHostDevice` + `IOSCSIPeripheralDevice` descriptors & signature inference
 pub fn probe_disk_chip(disk: &DiskInfo, db: &ChipDatabase) -> ChipInspection {
     let vid = disk.vid.clone();
@@ -165,13 +168,19 @@ pub fn probe_disk_chip(disk: &DiskInfo, db: &ChipDatabase) -> ChipInspection {
         flash_vendor_fallback: None,
         probe_status: String::new(),
         probe_trace: Vec::new(),
+        needs_windows_admin: false,
     };
 
     #[cfg(target_os = "windows")]
     {
         probe_windows_scsi_flash(disk, db, &mut insp);
-        // Re-run controller lookup if live SCSI Inquiry gave us fresh vendor/product/rev!
-        if insp.controller_match.is_none() || insp.controller_match.as_ref().map(|m| m.is_wildcard).unwrap_or(false) {
+        if insp.controller_match.is_none()
+            || insp
+                .controller_match
+                .as_ref()
+                .map(|m| m.is_wildcard)
+                .unwrap_or(false)
+        {
             if let Some(better) = db.lookup_controller_with_scsi(
                 insp.vid.as_deref().unwrap_or(""),
                 insp.pid.as_deref().unwrap_or(""),
@@ -204,7 +213,7 @@ pub fn probe_disk_chip(disk: &DiskInfo, db: &ChipDatabase) -> ChipInspection {
             ));
         }
         if insp.vid.is_some() || insp.controller_match.is_some() {
-            insp.probe_status = "已通过 macOS IOKit USB 描述符、SCSI 固件签名与 Chips.wdb 完成主控识别。受 macOS 内核 IOUSBMassStorageDriver 架构限制，用户态无法向 U 盘发送厂商私有 SCSI 指令读取裸闪存 Flash ID（如需直读裸闪存颗粒 ID，请在 Windows 版右键以管理员身份运行）。".to_string();
+            insp.probe_status = "已通过 macOS IOKit USB 描述符、SCSI 固件签名与 Chips.wdb 完成主控识别。受 macOS 内核 IOUSBMassStorageDriver 架构限制，用户态无法向 U 盘发送厂商私有 SCSI 指令读取裸闪存 Flash ID（Windows 版支持与 ChipGenius 相同的 10 大主控系 SCSI 穿透直读裸闪存）。".to_string();
         } else {
             insp.probe_status = "当前选中的不是 USB 移动存储设备（未获取到 USB VID/PID），无法匹配 U 盘主控；您可在下方直接搜索 Chips.wdb 离线数据库。".to_string();
         }
@@ -218,7 +227,7 @@ pub fn probe_disk_chip(disk: &DiskInfo, db: &ChipDatabase) -> ChipInspection {
     insp
 }
 
-/// Decodes Phison 16-bit big-endian chip ID found at byte offset `0x17A` of Phison `0x06 0x05` GetInfo response.
+/// Decodes Phison 16-bit big-endian chip ID found at byte offset `0x17A` of Phison `0x06 0x05` (528B) GetInfo response.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn decode_phison_chip_id(id: u16) -> Option<&'static str> {
     match id {
@@ -241,6 +250,76 @@ fn decode_phison_chip_id(id: u16) -> Option<&'static str> {
     }
 }
 
+/// Scans a controller SCSI response payload for an exact 4-byte Flash ID match in `Chips.wdb`,
+/// returning the 6-byte Flash ID, matched `FlashRecord`, and active CE count.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn find_wdb_flash_in_payload(
+    buf: &[u8],
+    db: &ChipDatabase,
+    preferred_offsets: &[usize],
+) -> Option<([u8; 6], FlashRecord, usize)> {
+    // 1. Check preferred controller-specific offsets first (fastest & supports multi-CE counting)
+    for &off in preferred_offsets {
+        if off + 6 <= buf.len() {
+            if let Some(rec) = db.lookup_exact_4bytes(&buf[off..off + 4]) {
+                let fid = [
+                    buf[off],
+                    buf[off + 1],
+                    buf[off + 2],
+                    buf[off + 3],
+                    buf[off + 4],
+                    buf[off + 5],
+                ];
+                let ces = count_matching_ce_slots(buf, off, &fid[..4]);
+                return Some((fid, rec, ces));
+            }
+        }
+    }
+
+    // 2. Scan whole payload at 1-byte granularity against the 1,136 exact 4-byte IDs in Chips.wdb
+    let limit = buf.len().saturating_sub(5);
+    for i in 0..limit {
+        if let Some(rec) = db.lookup_exact_4bytes(&buf[i..i + 4]) {
+            // Filter out accidental ASCII text like "2020" (0x32 0x30 ...) — known NAND IDs never start with ASCII digits
+            let b0 = buf[i];
+            if matches!(b0, 0x30..=0x39) {
+                continue;
+            }
+            let fid = [
+                buf[i],
+                buf[i + 1],
+                buf[i + 2],
+                buf[i + 3],
+                buf[i + 4],
+                buf[i + 5],
+            ];
+            let ces = count_matching_ce_slots(buf, i, &fid[..4]);
+            return Some((fid, rec, ces));
+        }
+    }
+    None
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn count_matching_ce_slots(buf: &[u8], base_off: usize, id4: &[u8]) -> usize {
+    for stride in [8usize, 16usize, 6usize, 32usize] {
+        let mut count = 0usize;
+        let mut pos = base_off;
+        while pos + 4 <= buf.len() && count < 16 {
+            if &buf[pos..pos + 4] == id4 {
+                count += 1;
+                pos += stride;
+            } else {
+                break;
+            }
+        }
+        if count >= 2 {
+            return count;
+        }
+    }
+    1
+}
+
 #[cfg(target_os = "windows")]
 fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipInspection) {
     use crate::disk::direct_io::AlignedBuffer;
@@ -250,11 +329,11 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
+    const IOCTL_SCSI_PASS_THROUGH: u32 = 0x0004D004;
     const IOCTL_SCSI_PASS_THROUGH_DIRECT: u32 = 0x0004D014;
     const SCSI_IOCTL_DATA_IN: u8 = 1;
 
-    /// Exact Windows SDK `SCSI_PASS_THROUGH_DIRECT` layout:
-    /// `size_of == 56` on 64-bit Windows (`x86_64` / `aarch64`), `44` on 32-bit Windows.
+    /// Exact Windows SDK `SCSI_PASS_THROUGH_DIRECT` (56 bytes on 64-bit, 44 bytes on 32-bit).
     #[repr(C)]
     struct ScsiPassThroughDirect {
         length: u16,
@@ -276,6 +355,31 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     struct ScsiPassThroughDirectWithSense {
         sptd: ScsiPassThroughDirect,
         sense_buf: [u8; 32],
+    }
+
+    /// Exact Windows SDK `SCSI_PASS_THROUGH` (buffered IOCTL 0x4D004 — used by 59 of 84 ChipGenius calls!).
+    #[repr(C)]
+    struct ScsiPassThrough {
+        length: u16,
+        scsi_status: u8,
+        path_id: u8,
+        target_id: u8,
+        lun: u8,
+        cdb_length: u8,
+        sense_info_length: u8,
+        data_in: u8,
+        data_transfer_length: u32,
+        time_out_value: u32,
+        data_buffer_offset: usize,
+        sense_info_offset: u32,
+        cdb: [u8; 16],
+    }
+
+    #[repr(C)]
+    struct ScsiPassThroughBuffered {
+        spt: ScsiPassThrough,
+        sense_buf: [u8; 32],
+        data_buf: [u8; 2048],
     }
 
     // Try opening both logical volume `\\.\E:` and physical drive `\\.\PhysicalDriveN`
@@ -308,10 +412,11 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     }
 
     let Some((file, opened_path)) = opened else {
+        insp.needs_windows_admin = true;
         insp.probe_trace
             .push(format!("无法打开设备句柄进行 SCSI 穿透: {}", last_err));
         insp.probe_status =
-            "未获取到设备 SCSI 穿透权限（请右键「以管理员身份运行」本软件以直读主控芯片型号与闪存 Flash ID）。"
+            "未获取到设备 SCSI 穿透权限（请点击下方「以管理员身份重启」按钮，或右键以管理员身份运行本软件以直读主控与闪存 Flash ID）。"
                 .to_string();
         return;
     };
@@ -319,56 +424,116 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         .push(format!("已打开底层 SCSI 设备句柄: {}", opened_path));
     let handle = file.as_raw_handle();
 
-    let send_cdb = |cdb: &[u8], out_len: usize| -> Result<Vec<u8>, u32> {
-        let alloc_len = ((out_len + 4095) / 4096) * 4096;
-        let mut aligned = AlignedBuffer::new(alloc_len);
-        let sense_off = std::mem::offset_of!(ScsiPassThroughDirectWithSense, sense_buf) as u32;
-        let mut req = ScsiPassThroughDirectWithSense {
-            sptd: ScsiPassThroughDirect {
-                length: std::mem::size_of::<ScsiPassThroughDirect>() as u16,
-                scsi_status: 0,
-                path_id: 0,
-                target_id: 0,
-                lun: 0,
-                cdb_length: cdb.len().min(16) as u8,
-                sense_info_length: 32,
-                data_in: SCSI_IOCTL_DATA_IN,
-                data_transfer_length: out_len as u32,
-                time_out_value: 4,
-                data_buffer: aligned.as_mut_slice().as_mut_ptr() as *mut std::ffi::c_void,
-                sense_info_offset: sense_off,
-                cdb: [0; 16],
-            },
-            sense_buf: [0; 32],
+    // Helper: sends via buffered IOCTL_SCSI_PASS_THROUGH (0x4D004) or DIRECT (0x4D014), with automatic fallback!
+    let send_cdb = |cdb: &[u8], out_len: usize, prefer_buffered: bool| -> Result<Vec<u8>, u32> {
+        let try_direct = || -> Result<Vec<u8>, u32> {
+            let alloc_len = ((out_len.max(16) + 4095) / 4096) * 4096;
+            let mut aligned = AlignedBuffer::new(alloc_len);
+            let sense_off =
+                std::mem::offset_of!(ScsiPassThroughDirectWithSense, sense_buf) as u32;
+            let mut req = ScsiPassThroughDirectWithSense {
+                sptd: ScsiPassThroughDirect {
+                    length: std::mem::size_of::<ScsiPassThroughDirect>() as u16,
+                    scsi_status: 0,
+                    path_id: 0,
+                    target_id: 0,
+                    lun: 0,
+                    cdb_length: cdb.len().min(16) as u8,
+                    sense_info_length: 32,
+                    data_in: SCSI_IOCTL_DATA_IN,
+                    data_transfer_length: out_len as u32,
+                    time_out_value: 4,
+                    data_buffer: aligned.as_mut_slice().as_mut_ptr() as *mut std::ffi::c_void,
+                    sense_info_offset: sense_off,
+                    cdb: [0; 16],
+                },
+                sense_buf: [0; 32],
+            };
+            for (i, &b) in cdb.iter().take(16).enumerate() {
+                req.sptd.cdb[i] = b;
+            }
+            let mut bytes_ret: u32 = 0;
+            let ok = unsafe {
+                DeviceIoControl(
+                    handle,
+                    IOCTL_SCSI_PASS_THROUGH_DIRECT,
+                    &mut req as *mut _ as *mut std::ffi::c_void,
+                    std::mem::size_of::<ScsiPassThroughDirectWithSense>() as u32,
+                    &mut req as *mut _ as *mut std::ffi::c_void,
+                    std::mem::size_of::<ScsiPassThroughDirectWithSense>() as u32,
+                    &mut bytes_ret,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok != 0 && req.sptd.scsi_status == 0 {
+                Ok(aligned.as_slice()[..out_len].to_vec())
+            } else {
+                Err(std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(req.sptd.scsi_status as i32) as u32)
+            }
         };
-        for (i, &b) in cdb.iter().take(16).enumerate() {
-            req.sptd.cdb[i] = b;
-        }
-        let mut bytes_ret: u32 = 0;
-        let ok = unsafe {
-            DeviceIoControl(
-                handle,
-                IOCTL_SCSI_PASS_THROUGH_DIRECT,
-                &mut req as *mut _ as *mut std::ffi::c_void,
-                std::mem::size_of::<ScsiPassThroughDirectWithSense>() as u32,
-                &mut req as *mut _ as *mut std::ffi::c_void,
-                std::mem::size_of::<ScsiPassThroughDirectWithSense>() as u32,
-                &mut bytes_ret,
-                std::ptr::null_mut(),
-            )
+
+        let try_buffered = || -> Result<Vec<u8>, u32> {
+            if out_len > 2048 {
+                return try_direct();
+            }
+            let sense_off = std::mem::offset_of!(ScsiPassThroughBuffered, sense_buf) as u32;
+            let data_off = std::mem::offset_of!(ScsiPassThroughBuffered, data_buf);
+            let mut req = ScsiPassThroughBuffered {
+                spt: ScsiPassThrough {
+                    length: std::mem::size_of::<ScsiPassThrough>() as u16,
+                    scsi_status: 0,
+                    path_id: 0,
+                    target_id: 0,
+                    lun: 0,
+                    cdb_length: cdb.len().min(16) as u8,
+                    sense_info_length: 32,
+                    data_in: SCSI_IOCTL_DATA_IN,
+                    data_transfer_length: out_len as u32,
+                    time_out_value: 4,
+                    data_buffer_offset: data_off,
+                    sense_info_offset: sense_off,
+                    cdb: [0; 16],
+                },
+                sense_buf: [0; 32],
+                data_buf: [0; 2048],
+            };
+            for (i, &b) in cdb.iter().take(16).enumerate() {
+                req.spt.cdb[i] = b;
+            }
+            let total_size = (data_off + out_len) as u32;
+            let mut bytes_ret: u32 = 0;
+            let ok = unsafe {
+                DeviceIoControl(
+                    handle,
+                    IOCTL_SCSI_PASS_THROUGH,
+                    &mut req as *mut _ as *mut std::ffi::c_void,
+                    total_size,
+                    &mut req as *mut _ as *mut std::ffi::c_void,
+                    total_size,
+                    &mut bytes_ret,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok != 0 && req.spt.scsi_status == 0 {
+                Ok(req.data_buf[..out_len].to_vec())
+            } else {
+                Err(std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(req.spt.scsi_status as i32) as u32)
+            }
         };
-        if ok != 0 && req.sptd.scsi_status == 0 {
-            Ok(aligned.as_slice()[..out_len].to_vec())
+
+        if prefer_buffered {
+            try_buffered().or_else(|_| try_direct())
         } else {
-            let err_code = std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(req.sptd.scsi_status as i32) as u32;
-            Err(err_code)
+            try_direct().or_else(|_| try_buffered())
         }
     };
 
-    // 1. Standard SCSI INQUIRY (0x12) — works on virtually every USB/SATA/NVMe disk
-    match send_cdb(&[0x12, 0x00, 0x00, 0x00, 0x60, 0x00], 96) {
+    // 1. Standard SCSI INQUIRY (0x12)
+    match send_cdb(&[0x12, 0x00, 0x00, 0x00, 0x60, 0x00], 96, true) {
         Ok(inq) if inq.len() >= 36 => {
             let v = String::from_utf8_lossy(&inq[8..16]).trim().to_string();
             let p = String::from_utf8_lossy(&inq[16..32]).trim().to_string();
@@ -388,185 +553,287 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         Ok(_) => {}
         Err(code) => {
             insp.probe_trace
-                .push(format!("SCSI INQUIRY (0x12) 未返回数据 (code={})", code));
+                .push(format!("SCSI INQUIRY (0x12) 失败 (code={})", code));
         }
     }
 
-    if !disk.kind.is_external_or_removable() {
-        insp.probe_status = "非可移动 USB 存储设备，已跳过 U 盘主控私有指令探测。".to_string();
+    // Only skip vendor probes on the OS boot/system drive; allow any non-system drive (even if bus was detected as Unknown/Fixed)
+    if disk.is_system {
+        insp.probe_status = "系统启动盘跳过 U 盘主控私有指令探测。".to_string();
         drop(file);
         return;
     }
 
-    // 2. Active ChipGenius-style multi-controller read-only vendor probes (NOT gated on VID!)
-    let mut flash_bytes: Option<[u8; 6]> = None;
-    let mut ce_count: Option<usize> = None;
-
-    // ---- Family A: Silicon Motion (慧荣 SMI) ----
-    if let Ok(info) = send_cdb(&[0xF0, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01], 512) {
-        if let Some(chip_str) = extract_ascii_chip_hint(
-            &info,
-            &["SM32", "SM23", "SM22", "3255", "3257", "3267", "3268", "3271", "3280", "3281", "3282"],
-        ) {
-            insp.probe_trace
-                .push(format!("SMI (0xF0 0x06) 命中主控固件: {}", chip_str));
-            insp.firmware_vendor_hint = Some("Silicon Motion (慧荣)".to_string());
-            insp.firmware_controller_hint = Some(chip_str);
-            if let Some(isp) = extract_ascii_chip_hint(&info, &["ISP ", "ISP-", "V1.", "V2."]) {
-                insp.firmware_version_hint = Some(isp);
-            }
+    // Helper to record a decoded Flash ID from any controller probe
+    let mut found_flash: Option<([u8; 6], Option<FlashRecord>, usize)> = None;
+    let mut try_capture_flash = |label: &str,
+                                 buf: &[u8],
+                                 preferred_offsets: &[usize],
+                                 vendor_name: &str,
+                                 insp: &mut ChipInspection|
+     -> bool {
+        if found_flash.is_some() {
+            return true;
         }
-    }
-    for (label, cdb) in [
-        ("SMI 0xF0 0x20", [0xF0, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
-        ("SMI 0xF0 0x0A", [0xF0, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
-    ] {
-        if flash_bytes.is_none() {
-            if let Ok(buf) = send_cdb(&cdb, 512) {
-                if let Some((fid, ces)) = extract_multi_ce_flash_id(&buf, 8) {
-                    insp.probe_trace.push(format!("{} 成功读取 Flash ID ({}CE)", label, ces));
-                    flash_bytes = Some(fid);
-                    ce_count = Some(ces);
-                    if insp.firmware_vendor_hint.is_none() {
-                        insp.firmware_vendor_hint = Some("Silicon Motion (慧荣)".to_string());
-                    }
+        // Ignore all-zero or all-0xFF dummy buffers
+        if buf.iter().all(|&b| b == 0x00) || buf.iter().all(|&b| b == 0xFF) {
+            return false;
+        }
+        // 1st priority: exact 4-byte match in Chips.wdb (virtually 0% false positive!)
+        if let Some((fid, rec, ces)) = find_wdb_flash_in_payload(buf, db, preferred_offsets) {
+            insp.probe_trace.push(format!(
+                "{} 命中 Chips.wdb 闪存: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} [{}CE] -> {} {}",
+                label, fid[0], fid[1], fid[2], fid[3], fid[4], fid[5], ces, rec.manufacturer, rec.flash_type
+            ));
+            found_flash = Some((fid, Some(rec), ces));
+            if insp.firmware_vendor_hint.is_none() && !vendor_name.is_empty() {
+                insp.firmware_vendor_hint = Some(vendor_name.to_string());
+            }
+            return true;
+        }
+        // 2nd priority: check preferred controller offsets for newer JEDEC NAND Flash ID not yet in 2019 Chips.wdb
+        for &off in preferred_offsets {
+            if off + 6 <= buf.len() && is_valid_6byte_flash_id(&buf[off..off + 6]) {
+                let fid = [
+                    buf[off],
+                    buf[off + 1],
+                    buf[off + 2],
+                    buf[off + 3],
+                    buf[off + 4],
+                    buf[off + 5],
+                ];
+                let ces = count_matching_ce_slots(buf, off, &fid[..4]);
+                insp.probe_trace.push(format!(
+                    "{} 读到裸 Flash ID (偏移 0x{:X}): {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} [{}CE]",
+                    label, off, fid[0], fid[1], fid[2], fid[3], fid[4], fid[5], ces
+                ));
+                found_flash = Some((fid, None, ces));
+                if insp.firmware_vendor_hint.is_none() && !vendor_name.is_empty() {
+                    insp.firmware_vendor_hint = Some(vendor_name.to_string());
                 }
+                return true;
+            }
+        }
+        // Log non-empty response prefix for diagnostics
+        let hex_head: String = buf
+            .iter()
+            .take(16)
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        insp.probe_trace
+            .push(format!("{} 返回 {}B (前16B: {})", label, buf.len(), hex_head));
+        false
+    };
+
+    // =========================================================================
+    // Exact ChipGenius v4.21 SCSI CDB Suites (all 10 major controller families)
+    // =========================================================================
+
+    // ---- 1. Silicon Motion (慧荣 SMI: SM325x / SM326x / SM327x / SM328x / SM2320) ----
+    // Exact ChipGenius 16-byte CDBs: F0 06, F0 20 (... 01 07), F0 2A, F0 04!
+    let smi_probes: &[(&str, [u8; 16], usize)] = &[
+        ("SMI F0 06 (SM326/327/328)", [0xF0, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0], 512),
+        ("SMI F0 20 (FlashID)",       [0xF0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x07, 0, 0, 0], 512),
+        ("SMI F0 2A (SM3257EN)",      [0xF0, 0x2A, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0], 512),
+        ("SMI F0 04 (SM325)",         [0xF0, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0, 0], 512),
+    ];
+    for &(label, cdb, len) in smi_probes {
+        if let Ok(buf) = send_cdb(&cdb, len, false) {
+            if let Some(chip_str) = extract_ascii_chip_hint(
+                &buf,
+                &["SM32", "SM23", "SM22", "3255", "3257", "3267", "3268", "3269", "3271", "3280", "3281", "3282"],
+            ) {
+                insp.firmware_vendor_hint = Some("Silicon Motion (慧荣)".to_string());
+                insp.firmware_controller_hint = Some(chip_str);
+            }
+            if try_capture_flash(label, &buf, &[0, 8, 16, 32, 64], "Silicon Motion (慧荣)", insp) {
+                break;
             }
         }
     }
 
-    // ---- Family B: Phison (群联) ----
-    if insp.firmware_controller_hint.is_none() || flash_bytes.is_none() {
-        if let Ok(info) = send_cdb(&[0x06, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], 512) {
+    // ---- 2. Phison (群联: PS2251-03/-07/-09/-11/-17/-19/-67/-68/-70) ----
+    // Exact ChipGenius CDBs: 06 05 (len=12, xfer=528!), 06 56 (len=12, xfer=512)!
+    if found_flash.is_none() || insp.firmware_controller_hint.is_none() {
+        if let Ok(info) = send_cdb(&[0x06, 0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 528, false) {
             if info.len() >= 0x17C {
                 let chip_id = u16::from_be_bytes([info[0x17A], info[0x17B]]);
                 if let Some(model) = decode_phison_chip_id(chip_id) {
-                    insp.probe_trace
-                        .push(format!("Phison (0x06 0x05) 命中主控芯片 ID 0x{:04X} -> {}", chip_id, model));
+                    insp.probe_trace.push(format!(
+                        "Phison 06 05 (528B) 命中芯片 ID 0x{:04X} -> {}",
+                        chip_id, model
+                    ));
                     insp.firmware_vendor_hint = Some("Phison (群联)".to_string());
                     insp.firmware_controller_hint = Some(model.to_string());
-                    // Extract Phison firmware version bytes (offset 0x94..0x9C or ASCII)
                     if let Some(fw) = extract_phison_fw_version(&info) {
                         insp.firmware_version_hint = Some(fw);
                     }
-                } else if let Some(chip_str) = extract_ascii_chip_hint(&info, &["PS22", "PS23", "FC11", "FC13"]) {
-                    insp.probe_trace.push(format!("0x06 0x05 命中主控标识: {}", chip_str));
+                }
+            }
+            let _ = try_capture_flash("Phison 06 05", &info, &[0, 0x10, 0x80], "Phison (群联)", insp);
+        }
+        if found_flash.is_none() {
+            if let Ok(buf) = send_cdb(&[0x06, 0x56, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 512, true) {
+                let _ = try_capture_flash("Phison 06 56", &buf, &[0, 16, 32], "Phison (群联)", insp);
+            }
+        }
+    }
+
+    // ---- 3. Chipsbank (芯邦: CBM2090..CBM2199E/S) ----
+    // Exact ChipGenius CDBs: EA 01 ... E3 (16B, xfer=1536), E6 00 (12B, xfer=128), E3 01 (12B, xfer=128)!
+    if found_flash.is_none() {
+        let cbm_probes: &[(&str, &[u8], usize)] = &[
+            ("Chipsbank EA 01", &[0xEA, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xE3], 1536),
+            ("Chipsbank E6 00", &[0xE6, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 128),
+            ("Chipsbank E3 01", &[0xE3, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 128),
+        ];
+        for &(label, cdb, len) in cbm_probes {
+            if let Ok(buf) = send_cdb(cdb, len, true) {
+                if let Some(chip_str) = extract_ascii_chip_hint(&buf, &["CBM20", "CBM21", "CBM11", "2098", "2099", "2199"]) {
+                    insp.firmware_vendor_hint = Some("Chipsbank (芯邦)".to_string());
                     insp.firmware_controller_hint = Some(chip_str);
                 }
-            }
-        }
-        for (label, cdb) in [
-            ("Phison 0x06 0x56", [0x06, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-            ("Phison 0x06 0x06", [0x06, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-        ] {
-            if flash_bytes.is_none() {
-                if let Ok(buf) = send_cdb(&cdb, 512) {
-                    if let Some((fid, ces)) = extract_multi_ce_flash_id(&buf, 16) {
-                        insp.probe_trace.push(format!("{} 成功读取 Flash ID ({}CE)", label, ces));
-                        flash_bytes = Some(fid);
-                        ce_count = Some(ces);
-                        if insp.firmware_vendor_hint.is_none() {
-                            insp.firmware_vendor_hint = Some("Phison (群联)".to_string());
-                        }
-                    }
+                if try_capture_flash(label, &buf, &[0, 8, 16, 32, 64, 512], "Chipsbank (芯邦)", insp) {
+                    break;
                 }
             }
         }
     }
 
-    // ---- Family C: Alcor Micro (安国) ----
-    if flash_bytes.is_none() {
-        for (label, cdb) in [
-            ("Alcor 0x06 0x00", [0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-            ("Alcor 0x06 0xF0", [0x06, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-            ("Alcor 0x06 0x09", [0x06, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-        ] {
-            if flash_bytes.is_none() {
-                if let Ok(buf) = send_cdb(&cdb, 512) {
-                    if let Some(chip_str) = extract_ascii_chip_hint(&buf, &["AU69", "AU64", "SC90"]) {
-                        insp.firmware_vendor_hint = Some("Alcor Micro (安国)".to_string());
-                        insp.firmware_controller_hint = Some(chip_str);
-                    }
-                    if let Some(fid) = extract_valid_flash_id(&buf[..64]) {
-                        insp.probe_trace.push(format!("{} 成功读取 Flash ID", label));
-                        flash_bytes = Some(fid);
-                        if insp.firmware_vendor_hint.is_none() {
-                            insp.firmware_vendor_hint = Some("Alcor Micro (安国)".to_string());
-                        }
-                    }
+    // ---- 4. Alcor Micro (安国: AU6981..AU6989SN / SN-GT / SNL / AU6998) ----
+    // Exact ChipGenius CDBs: FA 0E (8B, xfer=512), FA 00 (8B, xfer=512)!
+    if found_flash.is_none() {
+        let alcor_probes: &[(&str, &[u8], usize)] = &[
+            ("Alcor FA 0E", &[0xFA, 0x0E, 0, 0, 0, 0, 0, 0], 512),
+            ("Alcor FA 00", &[0xFA, 0x00, 0, 0, 0, 0, 0, 0], 512),
+        ];
+        for &(label, cdb, len) in alcor_probes {
+            if let Ok(buf) = send_cdb(cdb, len, false) {
+                if let Some(chip_str) = extract_ascii_chip_hint(&buf, &["AU69", "AU64", "SC90", "SC70"]) {
+                    insp.firmware_vendor_hint = Some("Alcor Micro (安国)".to_string());
+                    insp.firmware_controller_hint = Some(chip_str);
+                }
+                if try_capture_flash(label, &buf, &[0, 8, 16, 32], "Alcor Micro (安国)", insp) {
+                    break;
                 }
             }
         }
     }
 
-    // ---- Family D: Chipsbank (芯邦) ----
-    if flash_bytes.is_none() {
-        for (label, cdb) in [
-            ("Chipsbank 0xFA 0x06", [0xFA, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-            ("Chipsbank 0xFA 0x00", [0xFA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-        ] {
-            if flash_bytes.is_none() {
-                if let Ok(buf) = send_cdb(&cdb, 512) {
-                    if let Some(chip_str) = extract_ascii_chip_hint(&buf, &["CBM20", "CBM21", "CBM11"]) {
-                        insp.firmware_vendor_hint = Some("Chipsbank (芯邦)".to_string());
-                        insp.firmware_controller_hint = Some(chip_str);
-                    }
-                    if let Some(fid) = extract_valid_flash_id(&buf[..64]) {
-                        insp.probe_trace.push(format!("{} 成功读取 Flash ID", label));
-                        flash_bytes = Some(fid);
-                        if insp.firmware_vendor_hint.is_none() {
-                            insp.firmware_vendor_hint = Some("Chipsbank (芯邦)".to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ---- Family E: Innostor (银灿) ----
-    if flash_bytes.is_none() {
-        for (label, cdb) in [
-            ("Innostor 0xF0 0x04", [0xF0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-            ("Innostor 0xF0 0x01", [0xF0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-        ] {
-            if flash_bytes.is_none() {
-                if let Ok(buf) = send_cdb(&cdb, 512) {
-                    if let Some(chip_str) = extract_ascii_chip_hint(&buf, &["IS90", "IS91", "IS92"]) {
-                        insp.firmware_vendor_hint = Some("Innostor (银灿)".to_string());
-                        insp.firmware_controller_hint = Some(chip_str);
-                    }
-                    if let Some(fid) = extract_valid_flash_id(&buf[..64]) {
-                        insp.probe_trace.push(format!("{} 成功读取 Flash ID", label));
-                        flash_bytes = Some(fid);
-                        if insp.firmware_vendor_hint.is_none() {
-                            insp.firmware_vendor_hint = Some("Innostor (银灿)".to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ---- Family F: FirstChip (一芯) ----
-    if flash_bytes.is_none() {
-        if let Ok(buf) = send_cdb(&[0xFF, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], 512) {
-            if let Some(chip_str) = extract_ascii_chip_hint(&buf, &["FC11", "FC13", "FC83"]) {
-                insp.firmware_vendor_hint = Some("FirstChip (一芯)".to_string());
+    // ---- 5. Innostor (银灿: IS902 / IS903 / IS916 / IS917 / IS918 / IS918M) ----
+    // Exact ChipGenius CDBs: FC ... "INQU" (16B, 128B), FC ... "NAND" (16B, 512B), E0 10 06 90 ... 8A A3 (IS918M), CA 00 (IS918M_GA)!
+    if found_flash.is_none() {
+        let inno_inqu = [0xFC, 0x00, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, b'I', b'N', b'Q', b'U'];
+        if let Ok(buf) = send_cdb(&inno_inqu, 128, true) {
+            if let Some(chip_str) = extract_ascii_chip_hint(&buf, &["IS90", "IS91", "IS92"]) {
+                insp.probe_trace.push(format!("Innostor FC INQU 命中主控: {}", chip_str));
+                insp.firmware_vendor_hint = Some("Innostor (银灿)".to_string());
                 insp.firmware_controller_hint = Some(chip_str);
             }
-            if let Some(fid) = extract_valid_flash_id(&buf[..64]) {
-                insp.probe_trace.push("FirstChip (0xFF 0x01) 成功读取 Flash ID".to_string());
-                flash_bytes = Some(fid);
+        }
+        let inno_probes: &[(&str, &[u8], usize, bool)] = &[
+            ("Innostor FC NAND", &[0xFC, 0x00, 0x01, 0, 0, 0, 0, 0, 0x02, 0, 0, 0x05, b'N', b'A', b'N', b'D'], 512, false),
+            ("Innostor IS918M E0", &[0xE0, 0x10, 0x06, 0x90, 0x00, 0x0E, 0, 0, 0x01, 0, 0x8A, 0xA3], 512, true),
+            ("Innostor/ASolid CA 00", &[0xCA, 0x00, 0, 0, 0, 0, 0x06, 0, 0, 0, 0, 0], 512, true),
+        ];
+        for &(label, cdb, len, buffered) in inno_probes {
+            if let Ok(buf) = send_cdb(cdb, len, buffered) {
+                if let Some(chip_str) = extract_ascii_chip_hint(&buf, &["IS90", "IS91", "IS92", "AS32"]) {
+                    insp.firmware_vendor_hint = Some("Innostor (银灿)".to_string());
+                    insp.firmware_controller_hint = Some(chip_str);
+                }
+                if try_capture_flash(label, &buf, &[0, 8, 16, 32], "Innostor (银灿)", insp) {
+                    break;
+                }
             }
         }
     }
 
-    // ---- Family G: SAT-16 ATA IDENTIFY DEVICE (USB-SATA / USB-NVMe Bridges & SSD Flash Drives) ----
+    // ---- 6. FirstChip (一芯: FC1178 / FC1178BC / FC1178E / FC1179) ----
+    // Exact ChipGenius CDBs: F1 01 ... A0 (16B, 512B), F1 00 ... A1 (16B, 512B)!
+    if found_flash.is_none() {
+        let fc_probes: &[(&str, [u8; 16])] = &[
+            ("FirstChip F1 01 A0", [0xF1, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xA0]),
+            ("FirstChip F1 00 A1", [0xF1, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xA1]),
+        ];
+        for &(label, cdb) in fc_probes {
+            if let Ok(buf) = send_cdb(&cdb, 512, false) {
+                if let Some(chip_str) = extract_ascii_chip_hint(&buf, &["FC11", "FC13", "FC83"]) {
+                    insp.firmware_vendor_hint = Some("FirstChip (一芯)".to_string());
+                    insp.firmware_controller_hint = Some(chip_str);
+                }
+                if try_capture_flash(label, &buf, &[0, 8, 16, 32, 64], "FirstChip (一芯)", insp) {
+                    break;
+                }
+            }
+        }
+    }
+
+    // ---- 7. Solid State System (鑫创 SSS: SSS6673..SSS6698 / TC58NC66xx) ----
+    // Exact ChipGenius CDBs: FF 02 (12B, 16B), FF 00 68 (12B, 512B)!
+    if found_flash.is_none() {
+        if let Ok(buf) = send_cdb(&[0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16, true) {
+            let _ = try_capture_flash("SSS FF 02", &buf, &[0, 4, 8], "Solid State System (鑫创)", insp);
+        }
+        if found_flash.is_none() {
+            if let Ok(buf) = send_cdb(&[0xFF, 0x00, 0x68, 0, 0, 0, 0, 0, 0, 0, 0, 0], 512, true) {
+                let _ = try_capture_flash("SSS FF 00 68", &buf, &[0, 8, 16], "Solid State System (鑫创)", insp);
+            }
+        }
+    }
+
+    // ---- 8. Yeestor / SiliconGo / DM (得一微 / 硅格 / 点序: SG1580 / SG1581 / DM8233 / DM8235) ----
+    // Exact ChipGenius CDBs: A1 00 (16B, 36B), A5 00 00 00 01 (12B, 32B)!
+    if found_flash.is_none() {
+        if let Ok(buf) = send_cdb(&[0xA1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 36, false) {
+            if let Some(chip_str) = extract_ascii_chip_hint(&buf, &["SG15", "DM82", "YS90", "SiliconGo"]) {
+                insp.firmware_vendor_hint = Some("Yeestor / SiliconGo (得一微/硅格)".to_string());
+                insp.firmware_controller_hint = Some(chip_str);
+            }
+        }
+        if let Ok(buf) = send_cdb(&[0xA5, 0x00, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0], 32, false) {
+            let _ = try_capture_flash("Yeestor/SG A5", &buf, &[0, 8, 16], "Yeestor / SiliconGo (得一微/硅格)", insp);
+        }
+    }
+
+    // ---- 9. Micov (迈科微: MW8209 / MW8229 / MW8259 / MW8269 / MW8289) ----
+    // Exact ChipGenius CDBs: D3 00 (16B, 512B), D6 00 90 08 00 00 01 (16B, 16B)!
+    if found_flash.is_none() {
+        if let Ok(buf) = send_cdb(&[0xD6, 0x00, 0x90, 0x08, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16, true) {
+            let _ = try_capture_flash("Micov D6 00 90", &buf, &[0, 4, 8], "Micov (迈科微)", insp);
+        }
+        if found_flash.is_none() {
+            if let Ok(buf) = send_cdb(&[0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 512, true) {
+                let _ = try_capture_flash("Micov D3 00", &buf, &[0, 16, 32], "Micov (迈科微)", insp);
+            }
+        }
+    }
+
+    // ---- 10. ITE / Usbest (联阳: UT165 / UT167 / IT1167 / IT1170) + DF/F5 Probes ----
+    // Exact ChipGenius CDBs: FD 80 ... 06 ... 01 (16B, 64B), F2 00 (12B, 34B), F5 01 (12B, 24B), DF 00 ... D3 (16B, 512B)!
+    if found_flash.is_none() {
+        let extra_probes: &[(&str, &[u8], usize, &str)] = &[
+            ("ITE FD 80", &[0xFD, 0x80, 0, 0, 0, 0, 0, 0, 0x06, 0, 0, 0, 0, 0x01, 0, 0], 64, "ITE / Usbest (联阳)"),
+            ("ITE F2 00", &[0xF2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 34, "ITE / Usbest (联阳)"),
+            ("Vendor F5 01", &[0xF5, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 24, ""),
+            ("Vendor DF D3", &[0xDF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xD3], 512, ""),
+        ];
+        for &(label, cdb, len, vname) in extra_probes {
+            if let Ok(buf) = send_cdb(cdb, len, true) {
+                if try_capture_flash(label, &buf, &[0, 8, 16], vname, insp) {
+                    break;
+                }
+            }
+        }
+    }
+
+    // ---- 11. SAT-16 ATA IDENTIFY DEVICE (USB-SATA / USB-NVMe Bridges & SSD Flash Drives) ----
     let sat16_identify = [
         0x85, 0x08, 0x0E, 0x00, 0x00, 0x00, 0x01, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xEC, 0x00,
     ];
-    if let Ok(ata) = send_cdb(&sat16_identify, 512) {
+    if let Ok(ata) = send_cdb(&sat16_identify, 512, false) {
         if let Some((model, fw)) = parse_ata_identify_model_fw(&ata) {
             insp.probe_trace
                 .push(format!("SAT-16 ATA IDENTIFY 成功: {} (FW {})", model, fw));
@@ -574,54 +841,33 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
-    if let Some(fid) = flash_bytes {
+    if let Some((fid, rec_opt, ces)) = found_flash {
         let hex = format!(
             "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
             fid[0], fid[1], fid[2], fid[3], fid[4], fid[5]
         );
-        insp.flash_record = db.lookup_flash_id(&hex);
+        insp.flash_record = rec_opt.or_else(|| db.lookup_flash_id(&hex));
         if insp.flash_record.is_none() {
             insp.flash_vendor_fallback = Some(nand_manufacturer_name(fid[0]).to_string());
         }
         insp.flash_id_hex = Some(hex);
-        insp.flash_ce_count = ce_count;
-        insp.probe_status = "已通过 Windows 底层 SCSI 穿透成功直读主控固件与物理闪存 Flash ID！".to_string();
+        insp.flash_ce_count = Some(ces);
+        insp.probe_status =
+            "已通过 Windows 底层 SCSI 穿透成功直读主控与物理闪存 Flash ID！".to_string();
     } else if insp.firmware_controller_hint.is_some() {
-        insp.probe_status = "已通过底层 SCSI 穿透直读到主控型号，但该固件未开放裸闪存 Flash ID 读取。".to_string();
+        insp.probe_status =
+            "已通过底层 SCSI 穿透直读到主控型号，但该固件未返回可识别的裸闪存 Flash ID（可展开下方「底层探测诊断明细」查看原始返回字节）。"
+                .to_string();
     } else if insp.bridge_ata_model.is_some() {
-        insp.probe_status = "已通过 SAT-16 穿透读取到 USB 桥接内置固态硬盘型号与固件版本！".to_string();
+        insp.probe_status =
+            "已通过 SAT-16 穿透读取到 USB 桥接内置固态硬盘型号与固件版本！".to_string();
     } else {
         insp.probe_status =
-            "已完成 VID/PID、SCSI Inquiry 与全系主控探测；当前设备未响应公开私有指令（常见于闪迪/三星原厂加密主控或 NVMe 桥接盒）。"
+            "已完成全部 10 大主控系 SCSI 穿透探测；当前设备未响应公开私有指令（常见于原厂加密主控，可展开下方「底层探测诊断明细」反馈原始返回信息）。"
                 .to_string();
     }
 
     drop(file);
-}
-
-#[cfg(target_os = "windows")]
-fn extract_multi_ce_flash_id(buf: &[u8], stride: usize) -> Option<([u8; 6], usize)> {
-    let mut first: Option<[u8; 6]> = None;
-    let mut ce_count = 0usize;
-    let max_slots = (buf.len() / stride).min(16);
-    for slot in 0..max_slots {
-        let base = slot * stride;
-        if base + 6 > buf.len() {
-            break;
-        }
-        let s = &buf[base..base + 6];
-        if is_valid_6byte_flash_id(s) {
-            if first.is_none() {
-                first = Some([s[0], s[1], s[2], s[3], s[4], s[5]]);
-            }
-            ce_count += 1;
-        }
-    }
-    if let Some(f) = first {
-        return Some((f, ce_count.max(1)));
-    }
-    // Fallback sliding scan in first 64 bytes
-    extract_valid_flash_id(&buf[..buf.len().min(64)]).map(|f| (f, 1))
 }
 
 #[cfg(target_os = "windows")]
@@ -632,20 +878,7 @@ fn is_valid_6byte_flash_id(win: &[u8]) -> bool {
         && win[1] != 0xFF
         && !win.iter().all(|&b| b == win[0])
         && (win[2] != 0x00 || win[3] != 0x00)
-        && !(win[0] == 0x20 && win[1] == 0x20) // ignore ASCII spaces "  "
-}
-
-#[cfg(target_os = "windows")]
-fn extract_valid_flash_id(slice: &[u8]) -> Option<[u8; 6]> {
-    if slice.len() < 6 {
-        return None;
-    }
-    for win in slice.windows(6) {
-        if is_valid_6byte_flash_id(win) {
-            return Some([win[0], win[1], win[2], win[3], win[4], win[5]]);
-        }
-    }
-    None
+        && !(win[0] == 0x20 && win[1] == 0x20)
 }
 
 #[cfg(target_os = "windows")]
@@ -669,7 +902,6 @@ fn extract_ascii_chip_hint(buf: &[u8], prefixes: &[&str]) -> Option<String> {
 #[cfg(target_os = "windows")]
 fn extract_phison_fw_version(info: &[u8]) -> Option<String> {
     if info.len() >= 0x9B && info[0x94] < 0x30 && info[0x95] < 0x64 {
-        // Phison binary firmware version at 0x94..0x96 or ASCII around 0x94
         let v = format!("{:02X}.{:02X}.{:02X}", info[0x94], info[0x95], info[0x96]);
         if v != "00.00.00" && v != "FF.FF.FF" {
             return Some(v);
@@ -715,9 +947,23 @@ mod tests {
     }
 
     #[test]
+    fn payload_wdb_flash_scanner_finds_flash_id_and_counts_ce() {
+        let db = ChipDatabase::load_default();
+        // Simulate a 512-byte controller reply with a 2CE Toshiba TLC-16K Flash ID (98 3A 98 B3 76 72) at offset 16 & 32
+        let mut payload = vec![0u8; 512];
+        payload[16..22].copy_from_slice(&[0x98, 0x3A, 0x98, 0xB3, 0x76, 0x72]);
+        payload[32..38].copy_from_slice(&[0x98, 0x3A, 0x98, 0xB3, 0x76, 0x72]);
+
+        let (fid, rec, ces) =
+            find_wdb_flash_in_payload(&payload, &db, &[0, 16]).expect("found flash ID");
+        assert_eq!(fid, [0x98, 0x3A, 0x98, 0xB3, 0x76, 0x72]);
+        assert_eq!(rec.flash_type, "TLC-16K");
+        assert_eq!(ces, 2);
+    }
+
+    #[test]
     fn scsi_heuristic_identifies_oem_rebranded_controllers() {
         let db = ChipDatabase::load_default();
-        // Generic VID/PID + Alcor 8.07 SCSI signature
         let m = db
             .lookup_controller_with_scsi(
                 "0x058F",
@@ -730,7 +976,6 @@ mod tests {
             .expect("Alcor match");
         assert!(m.primary.chip_vendor.contains("Alcor"));
 
-        // Unknown/spoofed VID + PMAP Phison signature
         let p = db
             .lookup_controller_with_scsi(
                 "0xFFFF",
@@ -743,7 +988,6 @@ mod tests {
             .expect("Phison PMAP heuristic");
         assert!(p.primary.chip_vendor.contains("Phison"));
 
-        // ABCD:1234 Chipsbank/FirstChip classic fake/generic VID:PID
         let abcd = db
             .lookup_controller("0xABCD", "0x1234", None)
             .expect("ABCD:1234 match");
