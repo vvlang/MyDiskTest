@@ -31,6 +31,7 @@ pub struct ChipInspection {
     /// Diagnostic trace of every hardware probe step attempted
     pub probe_trace: Vec<String>,
     /// True on Windows when opening the volume for SCSI pass-through failed due to missing admin rights
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub needs_windows_admin: bool,
 }
 
@@ -566,11 +567,12 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
 
     // Helper to record a decoded Flash ID from any controller probe
     let mut found_flash: Option<([u8; 6], Option<FlashRecord>, usize)> = None;
-    let mut try_capture_flash = |label: &str,
-                                 buf: &[u8],
-                                 preferred_offsets: &[usize],
-                                 vendor_name: &str,
-                                 insp: &mut ChipInspection|
+    let try_capture_flash = |label: &str,
+                             buf: &[u8],
+                             preferred_offsets: &[usize],
+                             vendor_name: &str,
+                             found_flash: &mut Option<([u8; 6], Option<FlashRecord>, usize)>,
+                             insp: &mut ChipInspection|
      -> bool {
         if found_flash.is_some() {
             return true;
@@ -585,7 +587,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                 "{} 命中 Chips.wdb 闪存: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} [{}CE] -> {} {}",
                 label, fid[0], fid[1], fid[2], fid[3], fid[4], fid[5], ces, rec.manufacturer, rec.flash_type
             ));
-            found_flash = Some((fid, Some(rec), ces));
+            *found_flash = Some((fid, Some(rec), ces));
             if insp.firmware_vendor_hint.is_none() && !vendor_name.is_empty() {
                 insp.firmware_vendor_hint = Some(vendor_name.to_string());
             }
@@ -607,7 +609,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                     "{} 读到裸 Flash ID (偏移 0x{:X}): {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} [{}CE]",
                     label, off, fid[0], fid[1], fid[2], fid[3], fid[4], fid[5], ces
                 ));
-                found_flash = Some((fid, None, ces));
+                *found_flash = Some((fid, None, ces));
                 if insp.firmware_vendor_hint.is_none() && !vendor_name.is_empty() {
                     insp.firmware_vendor_hint = Some(vendor_name.to_string());
                 }
@@ -647,7 +649,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                 insp.firmware_vendor_hint = Some("Silicon Motion (慧荣)".to_string());
                 insp.firmware_controller_hint = Some(chip_str);
             }
-            if try_capture_flash(label, &buf, &[0, 8, 16, 32, 64], "Silicon Motion (慧荣)", insp) {
+            if try_capture_flash(label, &buf, &[0, 8, 16, 32, 64], "Silicon Motion (慧荣)", &mut found_flash, insp) {
                 break;
             }
         }
@@ -671,11 +673,11 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                     }
                 }
             }
-            let _ = try_capture_flash("Phison 06 05", &info, &[0, 0x10, 0x80], "Phison (群联)", insp);
+            let _ = try_capture_flash("Phison 06 05", &info, &[0, 0x10, 0x80], "Phison (群联)", &mut found_flash, insp);
         }
         if found_flash.is_none() {
             if let Ok(buf) = send_cdb(&[0x06, 0x56, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 512, true) {
-                let _ = try_capture_flash("Phison 06 56", &buf, &[0, 16, 32], "Phison (群联)", insp);
+                let _ = try_capture_flash("Phison 06 56", &buf, &[0, 16, 32], "Phison (群联)", &mut found_flash, insp);
             }
         }
     }
@@ -694,7 +696,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                     insp.firmware_vendor_hint = Some("Chipsbank (芯邦)".to_string());
                     insp.firmware_controller_hint = Some(chip_str);
                 }
-                if try_capture_flash(label, &buf, &[0, 8, 16, 32, 64, 512], "Chipsbank (芯邦)", insp) {
+                if try_capture_flash(label, &buf, &[0, 8, 16, 32, 64, 512], "Chipsbank (芯邦)", &mut found_flash, insp) {
                     break;
                 }
             }
@@ -714,7 +716,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                     insp.firmware_vendor_hint = Some("Alcor Micro (安国)".to_string());
                     insp.firmware_controller_hint = Some(chip_str);
                 }
-                if try_capture_flash(label, &buf, &[0, 8, 16, 32], "Alcor Micro (安国)", insp) {
+                if try_capture_flash(label, &buf, &[0, 8, 16, 32], "Alcor Micro (安国)", &mut found_flash, insp) {
                     break;
                 }
             }
@@ -743,7 +745,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                     insp.firmware_vendor_hint = Some("Innostor (银灿)".to_string());
                     insp.firmware_controller_hint = Some(chip_str);
                 }
-                if try_capture_flash(label, &buf, &[0, 8, 16, 32], "Innostor (银灿)", insp) {
+                if try_capture_flash(label, &buf, &[0, 8, 16, 32], "Innostor (银灿)", &mut found_flash, insp) {
                     break;
                 }
             }
@@ -763,7 +765,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                     insp.firmware_vendor_hint = Some("FirstChip (一芯)".to_string());
                     insp.firmware_controller_hint = Some(chip_str);
                 }
-                if try_capture_flash(label, &buf, &[0, 8, 16, 32, 64], "FirstChip (一芯)", insp) {
+                if try_capture_flash(label, &buf, &[0, 8, 16, 32, 64], "FirstChip (一芯)", &mut found_flash, insp) {
                     break;
                 }
             }
@@ -774,11 +776,11 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     // Exact ChipGenius CDBs: FF 02 (12B, 16B), FF 00 68 (12B, 512B)!
     if found_flash.is_none() {
         if let Ok(buf) = send_cdb(&[0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16, true) {
-            let _ = try_capture_flash("SSS FF 02", &buf, &[0, 4, 8], "Solid State System (鑫创)", insp);
+            let _ = try_capture_flash("SSS FF 02", &buf, &[0, 4, 8], "Solid State System (鑫创)", &mut found_flash, insp);
         }
         if found_flash.is_none() {
             if let Ok(buf) = send_cdb(&[0xFF, 0x00, 0x68, 0, 0, 0, 0, 0, 0, 0, 0, 0], 512, true) {
-                let _ = try_capture_flash("SSS FF 00 68", &buf, &[0, 8, 16], "Solid State System (鑫创)", insp);
+                let _ = try_capture_flash("SSS FF 00 68", &buf, &[0, 8, 16], "Solid State System (鑫创)", &mut found_flash, insp);
             }
         }
     }
@@ -793,7 +795,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
             }
         }
         if let Ok(buf) = send_cdb(&[0xA5, 0x00, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0], 32, false) {
-            let _ = try_capture_flash("Yeestor/SG A5", &buf, &[0, 8, 16], "Yeestor / SiliconGo (得一微/硅格)", insp);
+            let _ = try_capture_flash("Yeestor/SG A5", &buf, &[0, 8, 16], "Yeestor / SiliconGo (得一微/硅格)", &mut found_flash, insp);
         }
     }
 
@@ -801,11 +803,11 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     // Exact ChipGenius CDBs: D3 00 (16B, 512B), D6 00 90 08 00 00 01 (16B, 16B)!
     if found_flash.is_none() {
         if let Ok(buf) = send_cdb(&[0xD6, 0x00, 0x90, 0x08, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16, true) {
-            let _ = try_capture_flash("Micov D6 00 90", &buf, &[0, 4, 8], "Micov (迈科微)", insp);
+            let _ = try_capture_flash("Micov D6 00 90", &buf, &[0, 4, 8], "Micov (迈科微)", &mut found_flash, insp);
         }
         if found_flash.is_none() {
             if let Ok(buf) = send_cdb(&[0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 512, true) {
-                let _ = try_capture_flash("Micov D3 00", &buf, &[0, 16, 32], "Micov (迈科微)", insp);
+                let _ = try_capture_flash("Micov D3 00", &buf, &[0, 16, 32], "Micov (迈科微)", &mut found_flash, insp);
             }
         }
     }
@@ -821,7 +823,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         ];
         for &(label, cdb, len, vname) in extra_probes {
             if let Ok(buf) = send_cdb(cdb, len, true) {
-                if try_capture_flash(label, &buf, &[0, 8, 16], vname, insp) {
+                if try_capture_flash(label, &buf, &[0, 8, 16], vname, &mut found_flash, insp) {
                     break;
                 }
             }
