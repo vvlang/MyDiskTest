@@ -211,24 +211,38 @@ impl ChipDatabase {
         })
     }
 
-    /// Looks up USB controller info by VID, PID, and optional bcdDevice / firmware revision.
+    /// Looks up USB controller info by VID, PID, optional bcdDevice, and optional SCSI Inquiry strings.
     pub fn lookup_controller(
         &self,
         vid_raw: &str,
         pid_raw: &str,
         rev: Option<&str>,
     ) -> Option<ControllerMatch> {
+        self.lookup_controller_with_scsi(vid_raw, pid_raw, rev, None, None, None)
+    }
+
+    pub fn lookup_controller_with_scsi(
+        &self,
+        vid_raw: &str,
+        pid_raw: &str,
+        rev: Option<&str>,
+        scsi_vendor: Option<&str>,
+        scsi_product: Option<&str>,
+        scsi_rev: Option<&str>,
+    ) -> Option<ControllerMatch> {
         let vid = normalize_hex4(vid_raw);
         let pid = normalize_hex4(pid_raw);
         if vid.len() != 4 {
-            return None;
+            return infer_controller_from_scsi(scsi_vendor, scsi_product, scsi_rev);
         }
+
+        let effective_rev = scsi_rev.or(rev);
 
         if let Some(indices) = self.by_vid_pid.get(&(vid.clone(), pid.clone())) {
             let mut recs: Vec<ControllerRecord> =
                 indices.iter().map(|&i| self.controllers[i].clone()).collect();
             // Sort best match first: revision match > non-empty controller > Chips.wdb entry
-            if let Some(rev_str) = rev {
+            if let Some(rev_str) = effective_rev {
                 let rev_clean = rev_str.trim().to_ascii_lowercase();
                 recs.sort_by_key(|r| {
                     let rev_hit = !rev_clean.is_empty()
@@ -252,7 +266,16 @@ impl ChipDatabase {
         if let Some(indices) = self.by_vid_wild.get(&vid) {
             let recs: Vec<ControllerRecord> =
                 indices.iter().map(|&i| self.controllers[i].clone()).collect();
-            if let Some(primary) = recs.first().cloned() {
+            if let Some(mut primary) = recs.first().cloned() {
+                // Enrich wildcard match with SCSI Inquiry heuristic if controller model is empty
+                if primary.controller.is_empty() {
+                    if let Some(heur) = infer_controller_from_scsi(scsi_vendor, scsi_product, scsi_rev) {
+                        primary.controller = heur.primary.controller;
+                        if primary.note.is_empty() {
+                            primary.note = heur.primary.note;
+                        }
+                    }
+                }
                 return Some(ControllerMatch {
                     primary,
                     candidates: recs,
@@ -261,7 +284,8 @@ impl ChipDatabase {
             }
         }
 
-        None
+        // Fallback: SCSI Inquiry firmware signature heuristics (e.g. PMAP, 1100, 8.07, General UDisk 5.00)
+        infer_controller_from_scsi(scsi_vendor, scsi_product, scsi_rev)
     }
 
     /// Looks up a NAND Flash ID (e.g. "98 3A 98 B3 76 72" or "983A98B3").
@@ -410,30 +434,176 @@ pub fn is_known_nand_vendor(id: u8) -> bool {
     )
 }
 
+/// Infers controller family from classic USB Mass Storage SCSI Inquiry firmware signatures
+/// (used by ChipGenius when VID/PID is OEM-rebranded or spoofed).
+pub fn infer_controller_from_scsi(
+    vendor: Option<&str>,
+    product: Option<&str>,
+    rev: Option<&str>,
+) -> Option<ControllerMatch> {
+    let v = vendor.unwrap_or("").trim().to_ascii_uppercase();
+    let p = product.unwrap_or("").trim().to_ascii_uppercase();
+    let r = rev.unwrap_or("").trim().to_ascii_uppercase();
+
+    let (chip_vendor, controller, note) = if r == "PMAP" || p.contains("2307") || p.contains("2251") {
+        (
+            "Phison (群联)",
+            "PS2251 系列 (依据 SCSI PMAP 固件特征识别)",
+            "SCSI 修订号 PMAP 为群联 PS2251 主控典型特征",
+        )
+    } else if r == "1100" && (v.contains("SMI") || p.contains("USB DISK") || p.contains("FLASH") || v.contains("GENERIC") || v.contains("GENERAL")) {
+        (
+            "Silicon Motion (慧荣)",
+            "SM3267 / SM3268 / SM3281 系列 (依据 SCSI 1100 特征识别)",
+            "SCSI 修订号 1100 为慧荣 SM32xx 主控常见默认固件版本",
+        )
+    } else if (r == "8.07" || r == "8.00") && (p.contains("FLASH DISK") || v.contains("GENERIC") || v.contains("ALCOR")) {
+        (
+            "Alcor Micro (安国)",
+            "AU6989SN / AU6989SN-GT 系列 (依据 SCSI 8.07 特征识别)",
+            "Generic Flash Disk + Rev 8.07 为安国 AU6989 主控经典特征",
+        )
+    } else if (v.contains("GENERAL") && p.contains("UDISK")) || (r == "5.00" && p.contains("UDISK")) {
+        (
+            "Chipsbank (芯邦) / FirstChip (一芯)",
+            "CBM2099E / CBM2199E / FC1179 (依据 General UDisk 5.00 特征)",
+            "提醒：General UDisk 5.00 常见于芯邦/一芯公版盘及扩容黑盘，建议运行扩容测试核验！",
+        )
+    } else if v.contains("INNOSTOR") || p.contains("IS903") || p.contains("IS917") || p.contains("IS918") {
+        (
+            "Innostor (银灿)",
+            "IS903 / IS917 / IS918 系列",
+            "银灿高速 USB 3.0 主控方案",
+        )
+    } else if v.contains("SANDISK") {
+        (
+            "SanDisk (闪迪原厂)",
+            "SanDisk 原厂一体化主控",
+            "闪迪原厂封装（不支持公开第三方量产指令）",
+        )
+    } else if v.contains("SAMSUNG") && (p.contains("FLASH") || p.contains("BAR") || p.contains("FIT") || p.contains("PSSD")) {
+        (
+            "Samsung (三星原厂)",
+            "Samsung 原厂主控",
+            "三星原厂一体化封装方案",
+        )
+    } else if v.contains("KIOXIA") || v.contains("TOSHIBA") {
+        (
+            "Kioxia / Toshiba (铠侠 / 东芝)",
+            "Phison 定制 / 东芝原厂主控",
+            "铠侠/东芝零售 U 盘常见为群联定制主控 + 东芝原厂闪存",
+        )
+    } else {
+        return None;
+    };
+
+    let rec = ControllerRecord {
+        vid: "----".to_string(),
+        pid: "----".to_string(),
+        chip_vendor: chip_vendor.to_string(),
+        controller: controller.to_string(),
+        device_vendor: vendor.unwrap_or("").to_string(),
+        note: note.to_string(),
+        url: String::new(),
+        rev_filter: rev.unwrap_or("").to_string(),
+        from_supplement: true,
+    };
+    Some(ControllerMatch {
+        primary: rec.clone(),
+        candidates: vec![rec],
+        is_wildcard: true,
+    })
+}
+
 fn supplemental_controllers() -> Vec<ControllerRecord> {
     let entries: &[(&str, &str, &str, &str, &str)] = &[
+        // ---- Classic & Modern High-Volume Flash Controllers missing from 2019 Chips.wdb ----
+        ("ABCD", "1234", "Chipsbank (芯邦) / FirstChip (一芯)", "CBM2099E / CBM2199E / FC1179", "提醒：ABCD:1234 为公版/山寨黑盘高频 VID/PID，强烈建议执行扩容测试！"),
+        ("048D", "1234", "Chipsbank (芯邦) / FirstChip (一芯)", "CBM2099 / CBM2199 / FC1178 / FC1179", "提醒：048D:1234 常见于公版盘及扩容黑盘，建议核验真实容量！"),
+        ("346D", "5678", "FirstChip (一芯)", "FC1178 / FC1179 / FC1308", "一芯公版 U 盘主控方案（常见于廉价/礼品盘，建议检测扩容）"),
+        ("1E3D", "198A", "Chipsbank (芯邦)", "CBM2099 / CBM2099E / CBM2199", "芯邦经典 USB 2.0 主控"),
+        ("1E3D", "2093", "Chipsbank (芯邦)", "CBM2093", "芯邦 USB 2.0 主控"),
+        ("1E3D", "2095", "Chipsbank (芯邦)", "CBM2095 / CBM2096", "芯邦 USB 2.0 主控"),
+        ("1E3D", "2096", "Chipsbank (芯邦)", "CBM2096P / CBM2098", "芯邦 USB 2.0 主控"),
+        ("1E3D", "2098", "Chipsbank (芯邦)", "CBM2098E / CBM2098S", "芯邦 USB 2.0 主控"),
+        ("1E3D", "2099", "Chipsbank (芯邦)", "CBM2099E / CBM2099S", "芯邦高性价比主流 U 盘主控"),
+        ("1E3D", "2199", "Chipsbank (芯邦)", "CBM2199 / CBM2199E / CBM2199S", "芯邦 USB 2.0/3.0 主控"),
+        // ---- Alcor Micro (安国) ----
+        ("058F", "6387", "Alcor Micro (安国)", "AU6989SN / AU6989SN-GT / AU6989AN", "安国最高频公版 VID/PID（Windows 管理员下可直读具体型号与闪存）"),
+        ("058F", "1234", "Alcor Micro (安国)", "AU6989 量产/无闪存模式", "安国主控空片或量产模式"),
+        ("058F", "6366", "Alcor Micro (安国)", "AU6438 / AU6465 (SD/TF 读卡器主控)", "安国高速读卡器主控"),
+        ("058F", "6364", "Alcor Micro (安国)", "AU6477 (多合一读卡器主控)", "安国读卡器主控"),
+        // ---- Silicon Motion (慧荣 SMI) ----
+        ("090C", "1000", "Silicon Motion (慧荣)", "SM3267 / SM3268 / SM3271 / SM3281 系列", "慧荣通用 VID/PID（Windows 管理员下可直读具体主控与闪存 Flash ID）"),
+        ("090C", "2000", "Silicon Motion (慧荣)", "SM2320 / SM3282 (USB 3.2 固态 U 盘主控)", "单芯片高速 USB 3.2 固态 U 盘主控"),
+        ("090C", "3000", "Silicon Motion (慧荣)", "SM32xx Recovery / 量产模式", "设备处于慧荣工程恢复/量产模式"),
+        ("090C", "3267", "Silicon Motion (慧荣)", "SM3267AE / SM3267AB", "慧荣 USB 3.0 主流闪存主控"),
+        ("090C", "3268", "Silicon Motion (慧荣)", "SM3268AB", "慧荣 USB 3.0 主控"),
+        ("090C", "3281", "Silicon Motion (慧荣)", "SM3281L / SM3281AB", "慧荣 USB 3.2 Gen1 主流闪存主控"),
+        // ---- Phison (群联) ----
+        ("13FE", "4100", "Phison (群联)", "PS2251-67 (2267)", "群联 USB 2.0 经典主控"),
+        ("13FE", "4200", "Phison (群联)", "PS2251-68 (2268)", "群联 USB 2.0 主控"),
+        ("13FE", "4300", "Phison (群联)", "PS2251-68 / PS2251-70", "群联主流 U 盘主控"),
+        ("13FE", "5100", "Phison (群联)", "PS2251-03 (2303)", "群联 USB 3.0 双通道高速主控"),
+        ("13FE", "5200", "Phison (群联)", "PS2251-03 / PS2251-07", "群联 USB 3.0 高速主控"),
+        ("13FE", "5500", "Phison (群联)", "PS2251-07 (2307)", "群联高人气 USB 3.0 主控"),
+        ("13FE", "6300", "Phison (群联)", "PS2251-09 (2309) / PS2251-11", "群联 USB 3.1 高速主控"),
+        ("13FE", "6500", "Phison (群联)", "PS2251-17 (2317) / PS2251-19 (USB 3.2)", "群联 USB 3.2 高速 U 盘主控"),
+        ("13FE", "6700", "Phison (群联)", "PS2251-19 / U17 (USB 3.2)", "群联 USB 3.2 主流 U 盘主控"),
+        // ---- Innostor (银灿) ----
+        ("1F75", "0902", "Innostor (银灿)", "IS902 / IS902E (USB 3.0 双通道)", "银灿经典双通道高速主控"),
+        ("1F75", "0903", "Innostor (银灿)", "IS903 (USB 3.0 双贴神级主控)", "银灿发烧级双通道 SLC/MLC 主控"),
+        ("1F75", "0916", "Innostor (银灿)", "IS916 / IS916EN", "银灿 USB 3.0 主控"),
+        ("1F75", "0917", "Innostor (银灿)", "IS917 (USB 3.0 单通道)", "银灿高兼容性 USB 3.0 主控"),
+        ("1F75", "0918", "Innostor (银灿)", "IS918 / IS918M", "银灿 USB 3.1 主控"),
+        // ---- Skymedi (擎泰) ----
+        ("1516", "8628", "Skymedi (擎泰)", "SK6221 / SK6226", "擎泰 USB 2.0/3.0 主控"),
+        ("1516", "1213", "Skymedi (擎泰)", "SK6211 / SK6215", "擎泰 USB 2.0 主控"),
+        // ---- SanDisk (闪迪) ----
+        ("0781", "5567", "SanDisk (闪迪)", "SanDisk Cruzer Blade (CZ50) 原厂主控", "闪迪原厂一体化封装"),
+        ("0781", "5571", "SanDisk (闪迪)", "SanDisk Cruzer Fit (CZ33) 原厂主控", "闪迪原厂迷你盘"),
+        ("0781", "5575", "SanDisk (闪迪)", "SanDisk Cruzer Glide (CZ60) 原厂主控", "闪迪原厂主控"),
+        ("0781", "5580", "SanDisk (闪迪)", "SanDisk Extreme (CZ80) 高速固态主控", "闪迪经典高速固态 U 盘"),
+        ("0781", "5581", "SanDisk (闪迪)", "SanDisk Ultra (CZ48) 原厂主控", "闪迪原厂 USB 3.0 主控"),
+        ("0781", "5583", "SanDisk (闪迪)", "SanDisk Ultra Fit (CZ43/CZ430) 原厂主控", "闪迪原厂一体化封装"),
+        ("0781", "5588", "SanDisk (闪迪)", "SanDisk Extreme Pro (CZ880) 固态主控", "高速固态级 U 盘（支持 SAT/SMART）"),
+        ("0781", "5590", "SanDisk (闪迪)", "SanDisk Ultra Dual Drive (DD2/DD3)", "闪迪双接口原厂主控"),
+        ("0781", "5591", "SanDisk (闪迪)", "SanDisk Ultra Flair (CZ73) / Ultra Luxe", "闪迪金属原厂主控"),
+        ("0781", "5595", "SanDisk (闪迪)", "SanDisk Extreme Go (CZ800/CZ810)", "闪迪高速原厂主控"),
+        ("0781", "5597", "SanDisk (闪迪)", "SanDisk Ultra Shift (CZ410)", "闪迪原厂主控"),
+        ("0781", "5599", "SanDisk (闪迪)", "SanDisk Ultra Dual Drive Go (DDC3)", "闪迪 Type-C 双接口原厂主控"),
+        ("0781", "55A3", "SanDisk (闪迪)", "SanDisk Extreme Pro USB 3.2 (CZ880 新版)", "高速固态级 U 盘"),
+        ("0781", "55AE", "SanDisk (闪迪)", "SanDisk Extreme Portable SSD (E61/E81)", "闪迪移动固态硬盘"),
+        // ---- Kingston (金士顿) ----
+        ("0951", "1665", "Kingston (金士顿)", "DataTraveler 100 G3 (Phison/SMI 方案)", "金士顿零售盘（Windows 管理员下可直读群联/慧荣精确主控）"),
+        ("0951", "1666", "Kingston (金士顿)", "DataTraveler 100 G3 / Exodia (PS2251/SM3281)", "金士顿高频零售盘（常见群联或慧荣方案）"),
+        ("0951", "16A2", "Kingston (金士顿)", "DataTraveler SE9 G2", "金士顿金属盘"),
+        ("0951", "16BE", "Kingston (金士顿)", "DataTraveler Micro 3.1", "金士顿迷你 USB 3.1 盘"),
+        ("0951", "16D5", "Kingston (金士顿)", "DataTraveler Kyson / Exodia", "金士顿 USB 3.2 零售盘"),
+        ("0951", "172B", "Kingston (金士顿)", "DataTraveler Exodia M / DTX", "金士顿 USB 3.2 零售盘"),
+        ("0951", "177F", "Kingston (金士顿)", "DataTraveler Max (SMI SM2320 固态主控)", "10Gbps 固态级旗舰 U 盘"),
+        // ---- Toshiba / Kioxia / Transcend / Samsung / Lexar ----
+        ("0930", "6544", "Toshiba / Kioxia (东芝/铠侠)", "Phison 定制主控 (TC58/PS2251)", "东芝/铠侠原厂 U 盘"),
+        ("0930", "6545", "Toshiba / Kioxia (东芝/铠侠)", "Phison 定制主控 (隼闪/随闪系列)", "东芝/铠侠原厂 U 盘"),
+        ("8564", "1000", "Transcend (创见)", "Silicon Motion (慧荣) 定制主控", "创见 JetFlash 系列（多为慧荣 SM3267/3281 方案）"),
+        ("04E8", "61F5", "Samsung (三星)", "Samsung PSSD T5 / T7 (三星原厂主控)", "三星原厂移动固态硬盘"),
+        ("04E8", "61F6", "Samsung (三星)", "Samsung PSSD T7 Touch / Shield", "三星原厂移动固态硬盘"),
+        ("04E8", "4001", "Samsung (三星)", "Samsung PSSD T7 Shield / T9", "三星原厂高速移动固态硬盘"),
+        ("21C4", "0CD1", "Lexar (雷克沙)", "Lexar JumpDrive 系列", "雷克沙零售盘"),
+        // ---- Modern USB 3.2 / USB4 NVMe & SATA Bridges & Card Readers ----
         ("0BDA", "9210", "Realtek (瑞昱)", "RTL9210 / RTL9210B (USB 3.2 NVMe/SATA 桥接)", "常见于 10Gbps 固态硬盘盒与高速固态 U 盘"),
         ("0BDA", "9220", "Realtek (瑞昱)", "RTL9220DP (USB 3.2 Gen2x2 20Gbps 桥接)", "20Gbps 高速 NVMe 桥接主控"),
-        ("152D", "0583", "JMicron (智微)", "JMS583 (USB 3.1 Gen2 NVMe 桥接)", "常见于 10Gbps NVMe 移动固态硬盘盒"),
+        ("0BDA", "0328", "Realtek (瑞昱)", "RTS5328 / RTS5329 (USB 3.0 读卡器)", "瑞昱高速 SD/TF 读卡器主控"),
+        ("152D", "0562", "JMicron (智微)", "JMS562 (USB 3.0 SATA 桥接)", "智微移动硬盘盒主控"),
         ("152D", "0578", "JMicron (智微)", "JMS578 (USB 3.0 SATA 桥接)", "常见于 SATA 移动硬盘盒"),
+        ("152D", "0583", "JMicron (智微)", "JMS583 (USB 3.1 Gen2 NVMe 桥接)", "常见于 10Gbps NVMe 移动固态硬盘盒"),
+        ("174C", "1153", "ASMedia (祥硕)", "ASM1153E (USB 3.0 SATA 桥接)", "祥硕经典 SATA 硬盘盒主控"),
+        ("174C", "55AA", "ASMedia (祥硕)", "ASM1153E / ASM235CM (USB 3.1 SATA 桥接)", "祥硕高速 SATA 硬盘盒主控"),
         ("174C", "2362", "ASMedia (祥硕)", "ASM2362 (USB 3.1 Gen2 NVMe 桥接)", "10Gbps NVMe 桥接主控"),
         ("174C", "2364", "ASMedia (祥硕)", "ASM2364 (USB 3.2 Gen2x2 20Gbps 桥接)", "20Gbps NVMe 桥接主控"),
         ("174C", "2464", "ASMedia (祥硕)", "ASM2464PD (USB4 / Thunderbolt 4 40Gbps)", "40Gbps USB4 旗舰硬盘盒主控"),
-        ("090C", "2000", "Silicon Motion (慧荣)", "SM2320 / SM3282 (USB 3.2 固态 U 盘主控)", "单芯片高速 USB 3.2 固态 U 盘主控"),
-        ("090C", "3281", "Silicon Motion (慧荣)", "SM3281L / SM3281AB", "USB 3.2 Gen1 主流闪存主控"),
-        ("13FE", "6500", "Phison (群联)", "PS2251-17 / PS2251-19 (USB 3.2)", "USB 3.2 高速 U 盘主控"),
-        ("13FE", "6700", "Phison (群联)", "PS2251-19 / U17 (USB 3.2)", "USB 3.2 主流 U 盘主控"),
-        ("0781", "5583", "SanDisk (闪迪)", "SanDisk Ultra Fit / CZ430 原厂主控", "闪迪原厂一体化封装"),
-        ("0781", "5581", "SanDisk (闪迪)", "SanDisk Ultra / CZ48 原厂主控", "闪迪原厂主控"),
-        ("0781", "5588", "SanDisk (闪迪)", "SanDisk Extreme Pro CZ880 (固态主控)", "高速固态级 U 盘"),
-        ("0781", "5591", "SanDisk (闪迪)", "SanDisk Ultra Luxe / Dual Drive", "闪迪原厂主控"),
-        ("0781", "55A3", "SanDisk (闪迪)", "SanDisk Extreme Pro USB 3.2", "高速固态级 U 盘"),
-        ("090C", "1000", "Silicon Motion (慧荣)", "SM3267 / SM3268 / SM3281 系列", "慧荣通用 VID/PID，具体型号取决于固件版本"),
-        ("0951", "1666", "Kingston (金士顿)", "DataTraveler 100 G3 / Exodia (群联/慧荣代工)", "金士顿零售盘（常见 PS2251 或 SM3281 方案）"),
-        ("0951", "177F", "Kingston (金士顿)", "DataTraveler Max (SMI SM2320)", "10Gbps 固态级 U 盘"),
-        ("04E8", "61F5", "Samsung (三星)", "Samsung PSSD T5 / T7 (三星原厂主控)", "三星原厂移动固态硬盘"),
-        ("04E8", "4001", "Samsung (三星)", "Samsung PSSD T7 Shield / T9", "三星原厂高速移动固态硬盘"),
-        ("090C", "3000", "Silicon Motion (慧荣)", "SM32xx Recovery / 量产模式", "设备处于慧荣工程恢复模式"),
+        ("05E3", "0749", "Genesys Logic (创惟)", "GL3224 (USB 3.0 SD/TF 读卡器)", "创惟主流 USB 3.0 读卡器主控"),
+        ("05E3", "0751", "Genesys Logic (创惟)", "GL3232S (USB 3.2 SD/TF 读卡器)", "创惟高速读卡器主控"),
     ];
 
     entries

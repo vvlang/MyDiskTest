@@ -35,6 +35,12 @@ struct WinDiskMeta {
     media_type: Option<String>,
     #[serde(rename = "PnpId")]
     pnp_id: Option<String>,
+    #[serde(rename = "UsbPnpId")]
+    usb_pnp_id: Option<String>,
+    #[serde(rename = "UsbHwId")]
+    usb_hw_id: Option<String>,
+    #[serde(rename = "UsbVendor")]
+    usb_vendor: Option<String>,
     #[serde(rename = "FirmwareVersion")]
     firmware_version: Option<String>,
     #[serde(rename = "DiskNumber")]
@@ -123,10 +129,43 @@ pub fn scan_disks_windows() -> Vec<DiskInfo> {
             .map(|n| format!(r"\\.\PhysicalDrive{} ({}:)", n, letter))
             .unwrap_or_else(|| format!("{}:", letter));
 
+        // Extract VID/PID from walked parent USB\VID_xxxx&PID_xxxx first, falling back to DiskDrive PNPDeviceID
         let (vid, pid) = meta
-            .and_then(|m| m.pnp_id.as_deref())
+            .and_then(|m| {
+                m.usb_pnp_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .or(m.usb_hw_id.as_deref().filter(|s| !s.is_empty()))
+                    .or(m.pnp_id.as_deref())
+            })
             .map(parse_vid_pid_from_pnp)
             .unwrap_or((None, None));
+
+        // Extract USB bcdDevice (REV_xxxx from USB HardwareId) or SCSI/Disk FirmwareVersion
+        let bcd_device = meta
+            .and_then(|m| {
+                m.usb_hw_id
+                    .as_deref()
+                    .and_then(parse_rev_from_hw_id)
+                    .or_else(|| {
+                        m.firmware_version
+                            .as_deref()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                    })
+            });
+
+        let (scsi_vendor, scsi_product, scsi_rev) = meta
+            .and_then(|m| m.pnp_id.as_deref())
+            .map(parse_usbstor_ven_prod_rev)
+            .unwrap_or((None, None, None));
+
+        let vendor = meta
+            .and_then(|m| m.usb_vendor.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| scsi_vendor.clone())
+            .unwrap_or_default();
 
         let is_system = format!("{}:", letter).eq_ignore_ascii_case(&sys_drive);
         let bus_upper = bus_type.to_uppercase();
@@ -163,11 +202,6 @@ pub fn scan_disks_windows() -> Vec<DiskInfo> {
             .and_then(|m| m.disk_number)
             .map(|n| format!(r"\\.\PhysicalDrive{}", n));
 
-        let bcd_device = meta
-            .and_then(|m| m.firmware_version.clone())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
         results.push(DiskInfo {
             name: display_name,
             mount_point,
@@ -181,11 +215,14 @@ pub fn scan_disks_windows() -> Vec<DiskInfo> {
             kind,
             is_system,
             is_read_only,
-            vendor: String::new(),
+            vendor,
             model,
             vid,
             pid,
             bcd_device,
+            scsi_vendor,
+            scsi_product,
+            scsi_rev,
             serial,
             link_speed: None,
         });
@@ -214,6 +251,43 @@ fn parse_vid_pid_from_pnp(pnp: &str) -> (Option<String>, Option<String>) {
     (extract_hex4("VID_"), extract_hex4("PID_"))
 }
 
+fn parse_rev_from_hw_id(hw: &str) -> Option<String> {
+    let upper = hw.to_uppercase();
+    let idx = upper.find("REV_")?;
+    let rest = &upper[idx + 4..];
+    let hex: String = rest.chars().take(4).collect();
+    if hex.len() == 4 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Convert BCD "0100" -> "1.00", "1100" -> "11.00"
+        let major = hex[0..2].trim_start_matches('0');
+        let major = if major.is_empty() { "0" } else { major };
+        Some(format!("{}.{}", major, &hex[2..4]))
+    } else {
+        None
+    }
+}
+
+/// Parses `USBSTOR\DISK&VEN_SANDISK&PROD_ULTRA&REV_1.00\...` or `SCSI\DISK&VEN_...`.
+fn parse_usbstor_ven_prod_rev(pnp: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let extract = |tag: &str| -> Option<String> {
+        let upper = pnp.to_uppercase();
+        let idx = upper.find(tag)?;
+        let rest = &pnp[idx + tag.len()..];
+        let val = rest
+            .split(&['&', '\\'][..])
+            .next()
+            .unwrap_or("")
+            .replace('_', " ")
+            .trim()
+            .to_string();
+        if val.is_empty() {
+            None
+        } else {
+            Some(val)
+        }
+    };
+    (extract("VEN_"), extract("PROD_"), extract("REV_"))
+}
+
 fn query_windows_disk_metadata() -> HashMap<String, WinDiskMeta> {
     let mut map = HashMap::new();
     let ps_script = r#"
@@ -224,15 +298,38 @@ Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object {
     $disk = Get-Disk -Number $part.DiskNumber
     $phys = Get-PhysicalDisk | Where-Object { $_.DeviceId -eq [string]$part.DiskNumber } | Select-Object -First 1
     $wmi = Get-CimInstance Win32_DiskDrive | Where-Object { $_.Index -eq $part.DiskNumber } | Select-Object -First 1
+    $pnp = if ($wmi) { [string]$wmi.PNPDeviceID } else { "" }
+    $usbPnp = ""
+    $usbHw = ""
+    $usbVendor = ""
+    if ($pnp) {
+        $cur = $pnp
+        for ($depth = 0; $depth -lt 4; $depth++) {
+            if ($cur -match 'VID_[0-9A-Fa-f]{4}&PID_[0-9A-Fa-f]{4}') {
+                $usbPnp = $cur
+                $hwProp = Get-PnpDeviceProperty -InstanceId $cur -KeyName 'DEVPKEY_Device_HardwareIds'
+                if ($hwProp -and $hwProp.Data) { $usbHw = ($hwProp.Data -join ';') }
+                $mfgProp = Get-PnpDeviceProperty -InstanceId $cur -KeyName 'DEVPKEY_Device_Manufacturer'
+                if ($mfgProp -and $mfgProp.Data) { $usbVendor = [string]$mfgProp.Data }
+                break
+            }
+            $parentProp = Get-PnpDeviceProperty -InstanceId $cur -KeyName 'DEVPKEY_Device_Parent'
+            if (-not $parentProp -or -not $parentProp.Data) { break }
+            $cur = [string]$parentProp.Data
+        }
+    }
     $out += [PSCustomObject]@{
-        DriveLetter  = [string]$part.DriveLetter
-        DiskNumber   = [uint32]$part.DiskNumber
-        Model        = $disk.FriendlyName
-        BusType      = [string]$disk.BusType
-        SerialNumber = $disk.SerialNumber
-        Size         = [uint64]$disk.Size
-        MediaType    = if ($phys) { [string]$phys.MediaType } else { "" }
-        PnpId        = if ($wmi) { [string]$wmi.PNPDeviceID } else { "" }
+        DriveLetter     = [string]$part.DriveLetter
+        DiskNumber      = [uint32]$part.DiskNumber
+        Model           = $disk.FriendlyName
+        BusType         = [string]$disk.BusType
+        SerialNumber    = $disk.SerialNumber
+        Size            = [uint64]$disk.Size
+        MediaType       = if ($phys) { [string]$phys.MediaType } else { "" }
+        PnpId           = $pnp
+        UsbPnpId        = $usbPnp
+        UsbHwId         = $usbHw
+        UsbVendor       = $usbVendor
         FirmwareVersion = if ($wmi) { [string]$wmi.FirmwareRevision } else { [string]$disk.FirmwareVersion }
     }
 }

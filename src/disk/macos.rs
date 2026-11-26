@@ -14,6 +14,9 @@ struct UsbHardwareInfo {
     serial: Option<String>,
     speed: Option<String>,
     product_name: Option<String>,
+    scsi_vendor: Option<String>,
+    scsi_product: Option<String>,
+    scsi_rev: Option<String>,
 }
 
 pub fn scan_disks_macos() -> Vec<DiskInfo> {
@@ -266,6 +269,9 @@ fn inspect_mount_macos(
         vid: usb_hw.and_then(|h| h.vid.clone()),
         pid: usb_hw.and_then(|h| h.pid.clone()),
         bcd_device: usb_hw.and_then(|h| h.bcd_device.clone()),
+        scsi_vendor: usb_hw.and_then(|h| h.scsi_vendor.clone()),
+        scsi_product: usb_hw.and_then(|h| h.scsi_product.clone()),
+        scsi_rev: usb_hw.and_then(|h| h.scsi_rev.clone()),
         serial: usb_hw.and_then(|h| h.serial.clone()),
         link_speed: usb_hw.and_then(|h| h.speed.clone()),
     })
@@ -419,6 +425,24 @@ fn parse_ioreg_usb_tree(text: &str, map: &mut HashMap<String, UsbHardwareInfo>) 
                     cur_hw.speed = Some(humanize_ioreg_usb_speed(n));
                 }
             }
+            "Vendor Identification" => {
+                let s = val.trim_matches('"').trim();
+                if !s.is_empty() {
+                    cur_hw.scsi_vendor = Some(s.to_string());
+                }
+            }
+            "Product Identification" => {
+                let s = val.trim_matches('"').trim();
+                if !s.is_empty() {
+                    cur_hw.scsi_product = Some(s.to_string());
+                }
+            }
+            "Product Revision Level" => {
+                let s = val.trim_matches('"').trim();
+                if !s.is_empty() {
+                    cur_hw.scsi_rev = Some(s.to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -476,6 +500,9 @@ fn walk_usb_tree(node: &Value, map: &mut HashMap<String, UsbHardwareInfo>) {
             .get("_name")
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string()),
+        scsi_vendor: None,
+        scsi_product: None,
+        scsi_rev: None,
     };
 
     // If this USB node has `Media` entries, map each BSD name (e.g. "disk4") to its USB hardware info.

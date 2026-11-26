@@ -1,5 +1,6 @@
 /target
 /dist
+/ChipGenius_*
 **/*.rs.bk
 .DS_Store
 *.dmg

@@ -161,8 +161,16 @@ pub fn render_chip_panel(
                                 );
                             }
 
-                            // Highlighted Controller Vendor & Model
-                            if let Some(ref m) = insp.controller_match {
+                            // Highlighted Controller Vendor & Model (prefer direct firmware readout over DB guess!)
+                            let has_direct_fw = insp.firmware_controller_hint.is_some();
+                            if let Some(ref fw_v) = insp.firmware_vendor_hint {
+                                row_kv_accent(
+                                    ui,
+                                    "主控厂商",
+                                    &format!("{}（固件直读）", fw_v),
+                                    Color32::from_rgb(56, 189, 248),
+                                );
+                            } else if let Some(ref m) = insp.controller_match {
                                 let vendor_txt = if m.primary.chip_vendor.is_empty() {
                                     "未知厂商"
                                 } else {
@@ -174,29 +182,52 @@ pub fn render_chip_panel(
                                     vendor_txt,
                                     Color32::from_rgb(56, 189, 248),
                                 );
+                            }
 
-                                let ctrl_txt = insp
-                                    .firmware_controller_hint
-                                    .as_deref()
-                                    .filter(|s| !s.is_empty())
-                                    .map(|s| format!("{}（固件直读）", s))
-                                    .unwrap_or_else(|| {
-                                        if m.primary.controller.is_empty() {
-                                            "未知型号（仅匹配厂商 VID）".to_string()
-                                        } else if m.is_wildcard {
-                                            format!("{}（按 VID 通配）", m.primary.controller)
-                                        } else {
-                                            m.primary.controller.clone()
-                                        }
-                                    });
+                            if let Some(ref fw_c) = insp.firmware_controller_hint {
+                                row_kv_accent(
+                                    ui,
+                                    "主控型号",
+                                    &format!("{}（固件直读）", fw_c),
+                                    Color32::from_rgb(52, 211, 153),
+                                );
+                            } else if let Some(ref m) = insp.controller_match {
+                                let ctrl_txt = if m.primary.controller.is_empty() {
+                                    "未知型号（仅匹配厂商 VID）".to_string()
+                                } else if m.is_wildcard {
+                                    format!("{}（特征/VID匹配）", m.primary.controller)
+                                } else {
+                                    m.primary.controller.clone()
+                                };
                                 row_kv_accent(
                                     ui,
                                     "主控型号",
                                     &ctrl_txt,
                                     Color32::from_rgb(52, 211, 153),
                                 );
+                            } else {
+                                row_kv_accent(
+                                    ui,
+                                    "主控识别",
+                                    "未命中 Chips.wdb（非 U 盘或未收录的新款主控）",
+                                    Color32::from_rgb(148, 163, 184),
+                                );
+                            }
 
-                                if m.candidates.len() > 1 {
+                            if let Some(ref fw_ver) = insp.firmware_version_hint {
+                                row_kv_mono(ui, "主控固件版本", fw_ver);
+                            }
+                            if let Some(ref ata) = insp.bridge_ata_model {
+                                row_kv_accent(
+                                    ui,
+                                    "桥接内置 SSD",
+                                    ata,
+                                    Color32::from_rgb(52, 211, 153),
+                                );
+                            }
+
+                            if let Some(ref m) = insp.controller_match {
+                                if !has_direct_fw && m.candidates.len() > 1 {
                                     let others: Vec<String> = m
                                         .candidates
                                         .iter()
@@ -222,20 +253,6 @@ pub fn render_chip_panel(
                                     ui.hyperlink(&m.primary.url);
                                     ui.end_row();
                                 }
-                            } else if let Some(ref hint) = insp.firmware_controller_hint {
-                                row_kv_accent(
-                                    ui,
-                                    "主控型号",
-                                    hint,
-                                    Color32::from_rgb(52, 211, 153),
-                                );
-                            } else {
-                                row_kv_accent(
-                                    ui,
-                                    "主控识别",
-                                    "未命中 Chips.wdb（非 U 盘或未收录的新款主控）",
-                                    Color32::from_rgb(148, 163, 184),
-                                );
                             }
                         });
 
@@ -247,10 +264,14 @@ pub fn render_chip_panel(
                         .spacing([12.0, 6.0])
                         .show(&mut cols[1], |ui| {
                             if let Some(ref fid) = insp.flash_id_hex {
+                                let ce_str = insp
+                                    .flash_ce_count
+                                    .map(|n| format!("  [{}CE]", n))
+                                    .unwrap_or_default();
                                 row_kv_accent(
                                     ui,
                                     "闪存识别码 (ID)",
-                                    fid,
+                                    &format!("{}{}", fid, ce_str),
                                     Color32::from_rgb(56, 189, 248),
                                 );
                             } else {
@@ -300,6 +321,17 @@ pub fn render_chip_panel(
                             .small()
                             .color(Color32::from_rgb(148, 163, 184)),
                     );
+
+                    if !insp.probe_trace.is_empty() {
+                        cols[1].add_space(6.0);
+                        egui::CollapsingHeader::new("🔍 底层探测诊断明细")
+                            .default_open(false)
+                            .show(&mut cols[1], |ui| {
+                                for line in &insp.probe_trace {
+                                    ui.label(RichText::new(line).monospace().small().weak());
+                                }
+                            });
+                    }
                 });
             } else {
                 ui.weak("请在左侧选择一个 U 盘或存储设备以查看其主控与闪存信息。");

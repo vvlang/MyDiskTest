@@ -183,17 +183,22 @@ pub fn render_sidebar(
                     kv_row(ui, "VID / PID", &format!("{} / {}", vid, pid));
                 }
                 if let Some(insp) = chip_info {
-                    if let Some(ref m) = insp.controller_match {
-                        let ctrl = insp
-                            .firmware_controller_hint
-                            .as_deref()
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or(&m.primary.controller);
-                        let summary = if ctrl.is_empty() {
-                            m.primary.chip_vendor.clone()
+                    let ctrl_summary = if let Some(ref fc) = insp.firmware_controller_hint {
+                        if let Some(ref fv) = insp.firmware_vendor_hint {
+                            Some(format!("{} {}", fv, fc))
                         } else {
-                            format!("{} {}", m.primary.chip_vendor, ctrl)
-                        };
+                            Some(fc.clone())
+                        }
+                    } else {
+                        insp.controller_match.as_ref().map(|m| {
+                            if m.primary.controller.is_empty() {
+                                m.primary.chip_vendor.clone()
+                            } else {
+                                format!("{} {}", m.primary.chip_vendor, m.primary.controller)
+                            }
+                        })
+                    };
+                    if let Some(summary) = ctrl_summary {
                         ui.label(RichText::new("主控芯片").small().weak());
                         ui.label(
                             RichText::new(summary.trim())

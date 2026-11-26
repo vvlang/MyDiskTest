@@ -77,6 +77,10 @@ pub struct DiskInfo {
     pub pid: Option<String>,
     /// USB bcdDevice / firmware revision (e.g. "1.00", "11.00")
     pub bcd_device: Option<String>,
+    /// SCSI Inquiry Vendor / Product / Revision (captured from macOS ioreg or Windows SCSI/PnP)
+    pub scsi_vendor: Option<String>,
+    pub scsi_product: Option<String>,
+    pub scsi_rev: Option<String>,
     /// Serial number if available
     pub serial: Option<String>,
     /// USB link speed description if available
@@ -150,6 +154,9 @@ fn scan_disks_platform() -> Vec<DiskInfo> {
         vid: None,
         pid: None,
         bcd_device: None,
+        scsi_vendor: None,
+        scsi_product: None,
+        scsi_rev: None,
         serial: None,
         link_speed: None,
     }]
@@ -182,6 +189,9 @@ pub fn disk_info_for_custom_path(path: PathBuf) -> DiskInfo {
         vid: None,
         pid: None,
         bcd_device: None,
+        scsi_vendor: None,
+        scsi_product: None,
+        scsi_rev: None,
         serial: None,
         link_speed: None,
     }
