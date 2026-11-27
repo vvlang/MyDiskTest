@@ -1891,7 +1891,7 @@ dependencies = [
 
 [[package]]
 name = "mydisktest"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "chrono",
  "eframe",

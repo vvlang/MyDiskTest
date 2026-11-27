@@ -1969,9 +1969,14 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
             }
         }
 
-        // Flash ID read-only commands: always try the 2 canonical ChipGenius commands (CA 0F 00 01 & CA 04 01 01),
-        // and when CA 00 confirmed an ASolid/IS918 controller (including 18002 / IS918EN), try full read-only CA variants!
+        // Flash ID read-only commands: prioritize `CA 0F 00 01 06 AS` (verified on IS918EN 18002!)
+        // and the canonical ChipGenius commands (`CA 0F 00 01 AS` & `CA 04 01 01 06 AS`) FIRST so
+        // healthy IS918EN / IS918M_GA / AS3257 drives hit in ~5ms with zero timeout stalls!
         let mut asolid_flash_probes: Vec<(&str, [u8; 16])> = vec![
+            (
+                "IS918EN CA 0F 00 01 06 AS",
+                [0xCA, 0x0F, 0x00, 0x01, 0, 0, 0x06, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+            ),
             (
                 "IS918M_GA CA 0F 00 01 AS",
                 [0xCA, 0x0F, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
@@ -1994,10 +1999,6 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                 (
                     "IS918EN CA 0F 01 00 AS",
                     [0xCA, 0x0F, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
-                ),
-                (
-                    "IS918EN CA 0F 00 01 06 AS",
-                    [0xCA, 0x0F, 0x00, 0x01, 0, 0, 0x06, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
                 ),
                 (
                     "ASolid CA 04 00 01 06 AS",

@@ -322,12 +322,17 @@ pub fn scan_disks_windows() -> Vec<DiskInfo> {
         let vendor = hub_desc
             .as_ref()
             .and_then(|h| h.manufacturer.clone())
+            .or_else(|| scsi_vendor.clone())
             .or_else(|| {
                 pnp_meta
                     .map(|m| m.usb_vendor.trim().to_string())
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| {
+                        !s.is_empty()
+                            && !s.contains("兼容 USB")
+                            && !s.to_ascii_lowercase().contains("compatible usb")
+                            && !s.starts_with('(')
+                    })
             })
-            .or_else(|| scsi_vendor.clone())
             .unwrap_or_default();
 
         let protocol = hub_desc
@@ -1011,11 +1016,22 @@ fn query_usb_hub_descriptors(hub_instance_id: &str, port_num: u32) -> Option<Usb
         }
     });
 
+    let preferred_lang = get_usb_desc(3, 0, 0)
+        .and_then(|d| {
+            if d.len() >= 4 && d[1] == 3 {
+                Some(u16::from_le_bytes([d[2], d[3]]))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0x0409);
+
     let read_usb_string = |idx: u8| -> Option<String> {
         if idx == 0 {
             return None;
         }
-        let raw = get_usb_desc(3, idx, 0x0409)?;
+        let raw = get_usb_desc(3, idx, preferred_lang)
+            .or_else(|| if preferred_lang != 0x0409 { get_usb_desc(3, idx, 0x0409) } else { None })?;
         if raw.len() < 4 || raw[1] != 3 {
             return None;
         }

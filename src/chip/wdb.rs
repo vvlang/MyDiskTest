@@ -761,6 +761,7 @@ fn supplemental_flashes() -> Vec<FlashRecord> {
         // ---- Samsung (三星 V5 / V6 / V7 3D V-NAND) ----
         ("EC1E98AF", "TLC-16K", "[1CE]K9AFGY8J5B (Samsung V6 128L TLC)"),
         ("EC5E98AF", "TLC-16K", "[1CE]K9BFGY8J5B (Samsung V6/V7 512Gb TLC)"),
+        ("EC5E981F", "TLC-16K", "[1CE]K9CMGY8J5E / K9AHGD8J0E (Samsung V6 128L 512Gb 3D TLC)"),
         ("EC5E98BF", "TLC-16K", "[1CE]Samsung V7 176L 512Gb TLC"),
         // ---- SK Hynix (海力士 V5 / V6 / V7 3D NAND) ----
         ("AD7E280B", "TLC-16K", "[1CE]H25BFT8A1M8R (Hynix V5 96L 512Gb TLC)"),
