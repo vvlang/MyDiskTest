@@ -227,10 +227,15 @@ pub fn probe_disk_chip(disk: &DiskInfo, db: &ChipDatabase) -> ChipInspection {
     {
         if let (Some(ref v), Some(ref p)) = (&insp.vid, &insp.pid) {
             insp.probe_trace.push(format!(
-                "IOKit USB 描述符: VID={} PID={} bcdDevice={}",
+                "IOKit USB 描述符: VID={} PID={} bcdDevice={} 协议={} 速率={} 电流={}",
                 v,
                 p,
-                insp.bcd_device.as_deref().unwrap_or("-")
+                insp.bcd_device.as_deref().unwrap_or("-"),
+                disk.protocol,
+                disk.link_speed.as_deref().unwrap_or("-"),
+                disk.max_power_ma
+                    .map(|m| format!("{}mA", m))
+                    .unwrap_or_else(|| "-".to_string())
             ));
         }
         if let (Some(ref sv), Some(ref sp)) = (&insp.scsi_vendor, &insp.scsi_product) {
@@ -242,7 +247,7 @@ pub fn probe_disk_chip(disk: &DiskInfo, db: &ChipDatabase) -> ChipInspection {
             ));
         }
         if insp.vid.is_some() || insp.controller_match.is_some() {
-            insp.probe_status = "已通过 macOS IOKit USB 描述符、SCSI 固件签名与 Chips.wdb 完成主控识别。受 macOS 内核 IOUSBMassStorageDriver 架构限制，用户态无法向 U 盘发送厂商私有 SCSI 指令读取裸闪存 Flash ID（Windows 版已完整内置 ChipGenius v4.21 全部 17 大主控家族 SCSI 穿透直读引擎）。".to_string();
+            insp.probe_status = "已通过 macOS IOKit 精准读取 USB 协议、速率、电流与描述符，并结合 Chips.wdb 进行离线 VID/PID 主控推测。受苹果 macOS 内核 IOUSBMassStorageDriver 独占架构限制，免驱用户态无法向 U 盘发送厂商私有 SCSI 指令直读真实主控与裸闪存 Flash ID（如需直读多方案混用盘的精确主控与颗粒，请使用 Windows 版或虚拟机 USB 直通）。".to_string();
         } else {
             insp.probe_status = "当前选中的不是 USB 移动存储设备（未获取到 USB VID/PID），无法匹配 U 盘主控；您可在下方直接搜索 Chips.wdb 离线数据库。".to_string();
         }

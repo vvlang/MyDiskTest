@@ -10,6 +10,9 @@ struct UsbHardwareInfo {
     vid: Option<String>,
     pid: Option<String>,
     bcd_device: Option<String>,
+    bcd_usb: Option<String>,
+    bcd_usb_raw: Option<u16>,
+    max_power_ma: Option<u32>,
     manufacturer: Option<String>,
     serial: Option<String>,
     speed: Option<String>,
@@ -224,15 +227,13 @@ fn inspect_mount_macos(
             }
         });
 
-    let mut protocol = protocol_raw;
-    if let Some(hw) = usb_hw {
-        if let Some(ref spd) = hw.speed {
-            protocol = format!("{} ({})", protocol, spd);
-        }
-    }
+    let protocol = usb_hw
+        .and_then(|h| h.bcd_usb.clone())
+        .unwrap_or(protocol_raw);
 
     let vendor = usb_hw
         .and_then(|h| h.manufacturer.clone())
+        .or_else(|| usb_hw.and_then(|h| h.scsi_vendor.clone()))
         .unwrap_or_default();
     let model = if !media_name.is_empty() {
         media_name
@@ -274,7 +275,7 @@ fn inspect_mount_macos(
         scsi_rev: usb_hw.and_then(|h| h.scsi_rev.clone()),
         serial: usb_hw.and_then(|h| h.serial.clone()),
         link_speed: usb_hw.and_then(|h| h.speed.clone()),
-        max_power_ma: None,
+        max_power_ma: usb_hw.and_then(|h| h.max_power_ma),
         usb_manufacturer: usb_hw.and_then(|h| h.manufacturer.clone()),
         usb_product: usb_hw.and_then(|h| h.product_name.clone()),
     })
@@ -288,12 +289,11 @@ fn extract_bytes_in_parens(s: &str) -> Option<u64> {
     rest[..end].trim().parse::<u64>().ok()
 }
 
-/// Builds a lookup from BSD disk name (e.g. "disk4", "disk4s1") -> USB VID/PID/bcdDevice/speed.
+/// Builds a lookup from BSD disk name (e.g. "disk4", "disk4s1") -> USB VID/PID/bcdDevice/bcdUSB/power/speed.
 ///
-/// Primary source: `ioreg -r -c IOUSBHostDevice -l -w 0` (works on ALL macOS 12..27+ versions,
-/// including Apple Silicon USB3/USB4 hubs, UASP enclosures, and macOS 26/27 where Apple emptied
-/// legacy `SPUSBDataType`).
-/// Secondary fallback: `system_profiler SPUSBDataType -json` and `SPUSBHostDataType -json`.
+/// Primary source: `ioreg -r -c IOUSBHostDevice -l -w 0` (fast & works on ALL macOS 12..27+).
+/// Secondary enrichment: `system_profiler SPUSBHostDataType -json` (macOS 15+) and `SPUSBDataType -json`
+/// only when `ioreg` missed power draw (`max_power_ma`) or found no USB disks.
 fn query_usb_hardware_map() -> HashMap<String, UsbHardwareInfo> {
     let mut map = HashMap::new();
 
@@ -307,18 +307,26 @@ fn query_usb_hardware_map() -> HashMap<String, UsbHardwareInfo> {
         }
     }
 
-    // Legacy fallback for older macOS where SPUSBDataType still includes `Media` nodes
-    if let Ok(output) = Command::new("system_profiler")
-        .args(["SPUSBDataType", "-json"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(json) = serde_json::from_slice::<Value>(&output.stdout) {
-                if let Some(buses) = json.get("SPUSBDataType").and_then(|v| v.as_array()) {
-                    for bus in buses {
-                        walk_usb_tree(bus, &mut map);
+    let needs_enrichment =
+        map.is_empty() || map.values().any(|hw| hw.max_power_ma.is_none() || hw.bcd_usb.is_none());
+    if needs_enrichment {
+        for data_type in ["SPUSBHostDataType", "SPUSBDataType"] {
+            if let Ok(output) = Command::new("system_profiler")
+                .args([data_type, "-json"])
+                .output()
+            {
+                if output.status.success() {
+                    if let Ok(json) = serde_json::from_slice::<Value>(&output.stdout) {
+                        if let Some(buses) = json.get(data_type).and_then(|v| v.as_array()) {
+                            for bus in buses {
+                                walk_usb_tree(bus, &mut map);
+                            }
+                        }
                     }
                 }
+            }
+            if !map.is_empty() && map.values().all(|hw| hw.max_power_ma.is_some()) {
+                break;
             }
         }
     }
@@ -327,24 +335,38 @@ fn query_usb_hardware_map() -> HashMap<String, UsbHardwareInfo> {
 }
 
 /// Parses `ioreg -r -c IOUSBHostDevice -l -w 0` output by maintaining a nesting stack of
-/// `IOUSBHostDevice` ancestors so every descendant `IOMedia` `"BSD Name" = "diskN"` maps
-/// precisely to its immediate parent USB device (never a parent hub).
+/// `IOUSBHostDevice` ancestors and flushing collected BSD names on frame pop so that EVERY
+/// property anywhere inside the device subtree (including `bcdUSB`, `max_power_ma`, and SCSI
+/// `Vendor/Product/Revision` appearing before or after `BSD Name`) attaches accurately.
 fn parse_ioreg_usb_tree(text: &str, map: &mut HashMap<String, UsbHardwareInfo>) {
-    let mut stack: Vec<(usize, UsbHardwareInfo)> = Vec::new();
+    let mut stack: Vec<(usize, UsbHardwareInfo, Vec<String>)> = Vec::new();
     let mut in_usb_device_props = false;
+
+    let flush_frame = |hw: UsbHardwareInfo, bsds: Vec<String>, map: &mut HashMap<String, UsbHardwareInfo>| {
+        if hw.vid.is_some() {
+            for bsd in bsds {
+                map.insert(bsd, hw.clone());
+            }
+        }
+    };
 
     for line in text.lines() {
         if let Some(node_pos) = line.find("+-o ") {
-            // Pop any IOUSBHostDevice ancestors at same or deeper indent
-            while let Some(&(top_indent, _)) = stack.last() {
+            // Pop and flush any IOUSBHostDevice ancestors at same or deeper indent
+            while let Some(&(top_indent, _, _)) = stack.last() {
                 if top_indent >= node_pos {
-                    stack.pop();
+                    if let Some((_, hw, bsds)) = stack.pop() {
+                        flush_frame(hw, bsds, map);
+                    }
                 } else {
                     break;
                 }
             }
 
-            if line.contains("<class IOUSBHostDevice,") {
+            if line.contains("<class IOUSBHostDevice,")
+                || line.contains("<class IOUSBDevice,")
+                || line.contains("<class AppleUSBHostDevice,")
+            {
                 let name_raw = &line[node_pos + 4..];
                 let clean_name = name_raw
                     .split('@')
@@ -359,7 +381,7 @@ fn parse_ioreg_usb_tree(text: &str, map: &mut HashMap<String, UsbHardwareInfo>) 
                 if !clean_name.is_empty() {
                     hw.product_name = Some(clean_name);
                 }
-                stack.push((node_pos, hw));
+                stack.push((node_pos, hw, Vec::new()));
                 in_usb_device_props = true;
             } else {
                 in_usb_device_props = false;
@@ -367,7 +389,7 @@ fn parse_ioreg_usb_tree(text: &str, map: &mut HashMap<String, UsbHardwareInfo>) 
             continue;
         }
 
-        let Some((_, cur_hw)) = stack.last_mut() else {
+        let Some((_, cur_hw, cur_bsds)) = stack.last_mut() else {
             continue;
         };
 
@@ -384,8 +406,8 @@ fn parse_ioreg_usb_tree(text: &str, map: &mut HashMap<String, UsbHardwareInfo>) 
         match key {
             "BSD Name" => {
                 let bsd = val.trim_matches('"').trim();
-                if bsd.starts_with("disk") && cur_hw.vid.is_some() {
-                    map.insert(bsd.to_string(), cur_hw.clone());
+                if bsd.starts_with("disk") && !cur_bsds.iter().any(|b| b == bsd) {
+                    cur_bsds.push(bsd.to_string());
                 }
             }
             "idVendor" if in_usb_device_props || cur_hw.vid.is_none() => {
@@ -400,24 +422,60 @@ fn parse_ioreg_usb_tree(text: &str, map: &mut HashMap<String, UsbHardwareInfo>) 
             }
             "bcdDevice" if in_usb_device_props || cur_hw.bcd_device.is_none() => {
                 if let Some(n) = parse_u64_dec_or_hex(val) {
-                    let major = (n >> 8) & 0xFF;
-                    let minor = n & 0xFF;
-                    cur_hw.bcd_device = Some(format!("{:x}.{:02x}", major, minor));
+                    cur_hw.bcd_device = Some(format!("{:04X}", n & 0xFFFF));
                 }
             }
-            "USB Vendor Name" if in_usb_device_props || cur_hw.manufacturer.is_none() => {
+            "bcdUSB" if in_usb_device_props || cur_hw.bcd_usb.is_none() => {
+                if let Some(n) = parse_u64_dec_or_hex(val) {
+                    let bcd = (n & 0xFFFF) as u16;
+                    if bcd > 0 {
+                        let major = (bcd >> 8) & 0xFF;
+                        let minor = bcd & 0xFF;
+                        cur_hw.bcd_usb_raw = Some(bcd);
+                        cur_hw.bcd_usb = Some(format!("USB {:X}.{:02X}", major, minor));
+                    }
+                }
+            }
+            "kUSBCurrent" | "USB Current" | "Current Required" | "Bus Power Used"
+                if in_usb_device_props || cur_hw.max_power_ma.is_none() =>
+            {
+                if let Some(ma) = parse_power_ma_str(val) {
+                    cur_hw.max_power_ma = Some(ma);
+                }
+            }
+            "bMaxPower" | "MaxPower" | "kUSBMaxPower"
+                if in_usb_device_props || cur_hw.max_power_ma.is_none() =>
+            {
+                if let Some(raw) = parse_u64_dec_or_hex(val) {
+                    let raw_u32 = raw as u32;
+                    if raw_u32 > 0 {
+                        let is_usb3 = cur_hw.bcd_usb_raw.unwrap_or(0) >= 0x0300;
+                        let ma = if raw_u32 <= 255 {
+                            raw_u32 * if is_usb3 { 8 } else { 2 }
+                        } else {
+                            raw_u32
+                        };
+                        cur_hw.max_power_ma = Some(ma);
+                    }
+                }
+            }
+            "USB Vendor Name" | "kUSBVendorString"
+                if in_usb_device_props || cur_hw.manufacturer.is_none() =>
+            {
                 let s = val.trim_matches('"').trim();
                 if !s.is_empty() {
                     cur_hw.manufacturer = Some(s.to_string());
                 }
             }
-            "USB Product Name" if in_usb_device_props => {
+            "USB Product Name" | "kUSBProductString" if in_usb_device_props => {
                 let s = val.trim_matches('"').trim();
                 if !s.is_empty() {
                     cur_hw.product_name = Some(s.to_string());
                 }
             }
-            "USB Serial Number" if in_usb_device_props || cur_hw.serial.is_none() => {
+            "USB Serial Number" | "kUSBSerialNumberString"
+                if in_usb_device_props || cur_hw.serial.is_none() =>
+            {
                 let s = val.trim_matches('"').trim();
                 if !s.is_empty() && !s.eq_ignore_ascii_case("Not Provided") {
                     cur_hw.serial = Some(s.to_string());
@@ -426,6 +484,11 @@ fn parse_ioreg_usb_tree(text: &str, map: &mut HashMap<String, UsbHardwareInfo>) 
             "USBSpeed" if in_usb_device_props || cur_hw.speed.is_none() => {
                 if let Some(n) = parse_u64_dec_or_hex(val) {
                     cur_hw.speed = Some(humanize_ioreg_usb_speed(n));
+                }
+            }
+            "Device Speed" if in_usb_device_props && cur_hw.speed.is_none() => {
+                if let Some(n) = parse_u64_dec_or_hex(val) {
+                    cur_hw.speed = Some(humanize_legacy_device_speed(n));
                 }
             }
             "Vendor Identification" => {
@@ -449,6 +512,11 @@ fn parse_ioreg_usb_tree(text: &str, map: &mut HashMap<String, UsbHardwareInfo>) 
             _ => {}
         }
     }
+
+    // Flush any remaining active device frames on the stack
+    while let Some((_, hw, bsds)) = stack.pop() {
+        flush_frame(hw, bsds, map);
+    }
 }
 
 fn parse_u64_dec_or_hex(raw: &str) -> Option<u64> {
@@ -460,41 +528,109 @@ fn parse_u64_dec_or_hex(raw: &str) -> Option<u64> {
     }
 }
 
+/// Parses `"144 mA"`, `"500"`, `"0x90"` -> `Some(144)` / `Some(500)`.
+fn parse_power_ma_str(raw: &str) -> Option<u32> {
+    let s = raw.trim().trim_matches('"');
+    let token = s.split_whitespace().next().unwrap_or(s);
+    let n = parse_u64_dec_or_hex(token)? as u32;
+    if n > 0 && n <= 5000 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
 fn humanize_ioreg_usb_speed(speed_code: u64) -> String {
     match speed_code {
-        0 | 1 => "USB 1.0 (1.5 Mbps)".to_string(),
-        2 => "USB 1.1 (12 Mbps)".to_string(),
-        3 => "USB 2.0 (480 Mbps)".to_string(),
-        4 => "USB 3.0 (5 Gbps)".to_string(),
-        5 => "USB 3.2 Gen 2 (10 Gbps)".to_string(),
-        6 => "USB 3.2 Gen 2x2 (20 Gbps)".to_string(),
-        7 => "USB4 (40 Gbps)".to_string(),
+        0 | 1 => "低速 (LowSpeed 1.5Mbps)".to_string(),
+        2 => "全速 (FullSpeed 12Mbps)".to_string(),
+        3 => "高速 (HighSpeed 480Mbps)".to_string(),
+        4 => "超高速 (SuperSpeed 5Gbps)".to_string(),
+        5 => "超高速+ (SuperSpeed+ 10Gbps)".to_string(),
+        6 => "超高速+ (USB 3.2 Gen 2x2 20Gbps)".to_string(),
+        7 => "USB4 (40Gbps)".to_string(),
         other => format!("USB (Speed {})", other),
     }
 }
 
+fn humanize_legacy_device_speed(speed_code: u64) -> String {
+    match speed_code {
+        0 => "低速 (LowSpeed 1.5Mbps)".to_string(),
+        1 => "全速 (FullSpeed 12Mbps)".to_string(),
+        2 => "高速 (HighSpeed 480Mbps)".to_string(),
+        3 => "超高速 (SuperSpeed 5Gbps)".to_string(),
+        4 => "超高速+ (SuperSpeed+ 10Gbps)".to_string(),
+        other => format!("USB (Speed {})", other),
+    }
+}
+
+fn normalize_sp_hex4(raw: &str) -> Option<String> {
+    let tok = raw.split_whitespace().next().unwrap_or(raw).trim();
+    let hex = tok
+        .strip_prefix("0x")
+        .or_else(|| tok.strip_prefix("0X"))
+        .unwrap_or(tok);
+    if hex.is_empty() || hex.len() > 4 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let val = u16::from_str_radix(hex, 16).ok()?;
+    Some(format!("0x{:04X}", val))
+}
+
+fn normalize_sp_bcd_device(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if let Some((maj, min)) = s.split_once('.') {
+        let m1 = u8::from_str_radix(maj.trim(), 16).ok()?;
+        let m2 = u8::from_str_radix(min.trim(), 16).ok()?;
+        return Some(format!("{:02X}{:02X}", m1, m2));
+    }
+    if s.len() == 4 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(s.to_ascii_uppercase());
+    }
+    None
+}
+
 fn walk_usb_tree(node: &Value, map: &mut HashMap<String, UsbHardwareInfo>) {
+    let vid = node
+        .get("vendor_id")
+        .and_then(|v| v.as_str())
+        .and_then(normalize_sp_hex4);
+    let pid = node
+        .get("product_id")
+        .and_then(|v| v.as_str())
+        .and_then(normalize_sp_hex4);
+    let serial = node
+        .get("serial_num")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let max_power_ma = node
+        .get("bus_power_used")
+        .or_else(|| node.get("current_required"))
+        .or_else(|| node.get("extra_operating_current"))
+        .and_then(|v| {
+            v.as_u64()
+                .map(|n| n as u32)
+                .or_else(|| v.as_str().and_then(parse_power_ma_str))
+        })
+        .filter(|&ma| ma > 0 && ma <= 5000);
+
     let hw = UsbHardwareInfo {
-        vid: node
-            .get("vendor_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.split_whitespace().next().unwrap_or(s).to_string()),
-        pid: node
-            .get("product_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.split_whitespace().next().unwrap_or(s).to_string()),
+        vid: vid.clone(),
+        pid: pid.clone(),
         bcd_device: node
             .get("bcd_device")
             .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string()),
+            .and_then(normalize_sp_bcd_device),
+        bcd_usb: None,
+        bcd_usb_raw: None,
+        max_power_ma,
         manufacturer: node
             .get("manufacturer")
             .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string()),
-        serial: node
-            .get("serial_num")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string()),
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        serial: serial.clone(),
         speed: node
             .get("device_speed")
             .and_then(|v| v.as_str())
@@ -502,11 +638,36 @@ fn walk_usb_tree(node: &Value, map: &mut HashMap<String, UsbHardwareInfo>) {
         product_name: node
             .get("_name")
             .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string()),
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         scsi_vendor: None,
         scsi_product: None,
         scsi_rev: None,
     };
+
+    // Enrich existing ioreg entries matching this device's VID+PID (+ optional serial) with missing power/speed
+    if vid.is_some() && pid.is_some() {
+        for existing in map.values_mut() {
+            let vp_match = existing.vid == vid && existing.pid == pid;
+            let sn_match = serial.is_none()
+                || existing.serial.is_none()
+                || existing.serial == serial;
+            if vp_match && sn_match {
+                if existing.max_power_ma.is_none() {
+                    existing.max_power_ma = hw.max_power_ma;
+                }
+                if existing.speed.is_none() {
+                    existing.speed = hw.speed.clone();
+                }
+                if existing.bcd_device.is_none() {
+                    existing.bcd_device = hw.bcd_device.clone();
+                }
+                if existing.manufacturer.is_none() {
+                    existing.manufacturer = hw.manufacturer.clone();
+                }
+            }
+        }
+    }
 
     // If this USB node has `Media` entries, map each BSD name (e.g. "disk4") to its USB hardware info.
     if let Some(media_list) = node.get("Media").and_then(|v| v.as_array()) {
@@ -533,11 +694,11 @@ fn walk_usb_tree(node: &Value, map: &mut HashMap<String, UsbHardwareInfo>) {
 
 fn humanize_usb_speed(raw: &str) -> String {
     match raw {
-        "super_speed_plus" => "USB 3.2 Gen 2 (10 Gbps)".to_string(),
-        "super_speed" => "USB 3.0 (5 Gbps)".to_string(),
-        "high_speed" => "USB 2.0 (480 Mbps)".to_string(),
-        "full_speed" => "USB 1.1 (12 Mbps)".to_string(),
-        "low_speed" => "USB 1.0 (1.5 Mbps)".to_string(),
+        "super_speed_plus" => "超高速+ (SuperSpeed+ 10Gbps)".to_string(),
+        "super_speed" => "超高速 (SuperSpeed 5Gbps)".to_string(),
+        "high_speed" => "高速 (HighSpeed 480Mbps)".to_string(),
+        "full_speed" => "全速 (FullSpeed 12Mbps)".to_string(),
+        "low_speed" => "低速 (LowSpeed 1.5Mbps)".to_string(),
         other => other.to_string(),
     }
 }
@@ -566,13 +727,15 @@ mod tests {
         +-o AppleUSB30Hub@02210000  <class AppleUSB30Hub, id 0x1000dbe77>
           +-o AppleUSB30HubPort@02211000  <class AppleUSB30HubPort, id 0x1000dbe7b>
             +-o Flash Disk@02211000  <class IOUSBHostDevice, id 0x1000f0001>
-              |   "USB Vendor Name" = "General"
-              |   "USB Product Name" = "USB Flash Disk"
-              |   "USB Serial Number" = "AA0401270001"
+              |   "USB Vendor Name" = "Kingston"
+              |   "USB Product Name" = "DataTraveler 3.0"
+              |   "USB Serial Number" = "E0D55EA574D51891D8750356"
               |   "USBSpeed" = 4
-              |   "idVendor" = 2316
-              |   "idProduct" = 4096
-              |   "bcdDevice" = 4352
+              |   "idVendor" = 2385
+              |   "idProduct" = 5734
+              |   "bcdDevice" = 272
+              |   "bcdUSB" = 800
+              |   "bMaxPower" = 18
               +-o IOUSBHostInterface@0  <class IOUSBHostInterface, id 0x1000f0002>
                 +-o IOUSBMassStorageDriver  <class IOUSBMassStorageDriver, id 0x1000f0003>
                   +-o Generic Flash Disk Media  <class IOMedia, id 0x1000f0004>
@@ -580,21 +743,31 @@ mod tests {
                     +-o FDisk_partition_scheme  <class IOFDiskPartitionScheme, id 0x1000f0005>
                       +-o DOS_FAT_32_Untitled_1@1  <class IOMedia, id 0x1000f0006>
                         |   "BSD Name" = "disk4s1"
+                  +-o IOSCSIPeripheralDeviceNub  <class IOSCSIPeripheralDeviceNub, id 0x1000f0007>
+                    |   "Vendor Identification" = "Kingston"
+                    |   "Product Identification" = "DataTraveler 3.0"
+                    |   "Product Revision Level" = "0000"
 "#;
         let mut map = HashMap::new();
         parse_ioreg_usb_tree(sample, &mut map);
 
         let d4 = map.get("disk4").expect("disk4 mapped");
-        assert_eq!(d4.vid.as_deref(), Some("0x090C"));
-        assert_eq!(d4.pid.as_deref(), Some("0x1000"));
-        assert_eq!(d4.bcd_device.as_deref(), Some("11.00"));
-        assert_eq!(d4.manufacturer.as_deref(), Some("General"));
-        assert_eq!(d4.product_name.as_deref(), Some("USB Flash Disk"));
-        assert_eq!(d4.serial.as_deref(), Some("AA0401270001"));
-        assert_eq!(d4.speed.as_deref(), Some("USB 3.0 (5 Gbps)"));
+        assert_eq!(d4.vid.as_deref(), Some("0x0951"));
+        assert_eq!(d4.pid.as_deref(), Some("0x1666"));
+        assert_eq!(d4.bcd_device.as_deref(), Some("0110"));
+        assert_eq!(d4.bcd_usb.as_deref(), Some("USB 3.20"));
+        assert_eq!(d4.max_power_ma, Some(144));
+        assert_eq!(d4.manufacturer.as_deref(), Some("Kingston"));
+        assert_eq!(d4.product_name.as_deref(), Some("DataTraveler 3.0"));
+        assert_eq!(d4.serial.as_deref(), Some("E0D55EA574D51891D8750356"));
+        assert_eq!(d4.speed.as_deref(), Some("超高速 (SuperSpeed 5Gbps)"));
+        // Even though SCSI properties appeared AFTER BSD Name, frame-pop flushing attached them!
+        assert_eq!(d4.scsi_vendor.as_deref(), Some("Kingston"));
+        assert_eq!(d4.scsi_rev.as_deref(), Some("0000"));
 
         let d4s1 = map.get("disk4s1").expect("disk4s1 mapped");
-        assert_eq!(d4s1.vid.as_deref(), Some("0x090C"));
-        assert_eq!(d4s1.pid.as_deref(), Some("0x1000"));
+        assert_eq!(d4s1.vid.as_deref(), Some("0x0951"));
+        assert_eq!(d4s1.bcd_usb.as_deref(), Some("USB 3.20"));
+        assert_eq!(d4s1.max_power_ma, Some(144));
     }
 }

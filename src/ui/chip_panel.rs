@@ -223,15 +223,15 @@ pub fn render_chip_panel(
                                 let ctrl_txt = if m.primary.controller.is_empty() {
                                     "未知型号（仅匹配厂商 VID）".to_string()
                                 } else if m.is_wildcard {
-                                    format!("{}（特征/VID匹配）", m.primary.controller)
+                                    format!("{}（离线库 VID/特征推测）", m.primary.controller)
                                 } else {
-                                    m.primary.controller.clone()
+                                    format!("{}（离线库 VID/PID 推测，非固件直读）", m.primary.controller)
                                 };
                                 row_kv_accent(
                                     ui,
                                     "主控型号",
                                     &ctrl_txt,
-                                    Color32::from_rgb(52, 211, 153),
+                                    Color32::from_rgb(245, 158, 11),
                                 );
                             } else {
                                 row_kv_accent(
