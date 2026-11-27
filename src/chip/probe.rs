@@ -409,24 +409,30 @@ fn deinterleave_micov_d6(buf: &[u8]) -> Option<([u8; 6], [u8; 6])> {
     Some((even, odd))
 }
 
-/// Parses Innostor `FC ... "INQU"` (128-byte) response to extract full model + revision
-/// (e.g., `IS902E-A1`, `IS903-A5`, `IS917-E1`) and classify controller generation.
+/// Parses Innostor `FC ... "INQU"` (128-byte) response to extract full model + chip revision
+/// (e.g., `IS902E-A1`, `IS903-A5`, `IS917-E1`) using ChipGenius `0x0045E094` (`buf[0]` hex rev).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn parse_innostor_inqu(buf: &[u8]) -> Option<String> {
-    extract_ascii_chip_hint(
+    let base = extract_ascii_chip_hint(
         buf,
         &[
             "IS902E", "IS902", "IS903", "IS916EN", "IS916", "IS917", "IS918M", "IS918",
         ],
-    )
+    )?;
+    // If model doesn't already have a `-XX` suffix and payload byte 0 holds chip stepping (e.g. 0xA1 -> "-A1")
+    if !base.contains('-') && !buf.is_empty() && buf[0] != 0x00 && buf[0] != 0xFF {
+        Some(format!("{}-{:02X}", base, buf[0]))
+    } else {
+        Some(base)
+    }
 }
 
-/// Parses Innostor `FC <04|05> FE ... "NFTL"` (16-byte) response for 4-byte firmware version
-/// (e.g. `[2, 7, 18, 0]` -> `"2.07.18.00"`).
+/// Parses Innostor `FC <04|05> FE ... "NFTL"` (16-byte) response for 4-byte BCD/hex firmware version
+/// (e.g. `[0x02, 0x07, 0x18, 0x00]` -> `"2.07.18.00"`).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn parse_innostor_nftl_fw(buf: &[u8]) -> Option<String> {
-    if buf.len() >= 4 && buf[0] > 0 && buf[0] < 20 && !(buf[1] == 0xFF && buf[2] == 0xFF) {
-        Some(format!("{}.{:02}.{:02}.{:02}", buf[0], buf[1], buf[2], buf[3]))
+    if buf.len() >= 4 && buf[0] > 0 && buf[0] < 0x30 && !(buf[1] == 0xFF && buf[2] == 0xFF) {
+        Some(format!("{:X}.{:02X}.{:02X}.{:02X}", buf[0], buf[1], buf[2], buf[3]))
     } else {
         None
     }
@@ -821,10 +827,12 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
             };
             if ok != 0 && req.sptd.scsi_status == 0 {
                 Ok(aligned.as_slice()[..out_len].to_vec())
+            } else if ok != 0 {
+                Err(0x10000 | (req.sptd.scsi_status as u32))
             } else {
                 Err(std::io::Error::last_os_error()
                     .raw_os_error()
-                    .unwrap_or(req.sptd.scsi_status as i32) as u32)
+                    .unwrap_or(-1) as u32)
             }
         };
 
@@ -872,10 +880,12 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
             };
             if ok != 0 && req.spt.scsi_status == 0 {
                 Ok(req.data_buf[..out_len].to_vec())
+            } else if ok != 0 {
+                Err(0x10000 | (req.spt.scsi_status as u32))
             } else {
                 Err(std::io::Error::last_os_error()
                     .raw_os_error()
-                    .unwrap_or(req.spt.scsi_status as i32) as u32)
+                    .unwrap_or(-1) as u32)
             }
         };
 
@@ -918,6 +928,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     }
 
     let mut found_flash: Option<([u8; 6], Option<FlashRecord>, usize)> = None;
+    let mut innostor_needs_ram_applet = false;
 
     // =========================================================================
     // STAGE 1: Exact ChipGenius v4.21 Unconditional Safe Probes (Families 1..8)
@@ -1423,6 +1434,34 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
             }
         }
 
+        // If Innostor runtime firmware advertises "PINF" (Product Info), probe it read-only too
+        if detected_inno_model.is_some() && found_flash.is_none() {
+            for (lbl, cdb) in [
+                (
+                    "Innostor FC PINF (0x00)",
+                    [0xFC, 0x00, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, b'P', b'I', b'N', b'F'],
+                ),
+                (
+                    "Innostor FC PINF (0x04)",
+                    [0xFC, 0x04, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, b'P', b'I', b'N', b'F'],
+                ),
+            ] {
+                if let Ok(buf) = send_cdb(&cdb, 128, true) {
+                    if try_capture_flash(
+                        lbl,
+                        &buf,
+                        &[0, 8, 16, 32],
+                        "Innostor (银灿)",
+                        db,
+                        &mut found_flash,
+                        insp,
+                    ) {
+                        break;
+                    }
+                }
+            }
+        }
+
         for &(label, cdb) in &nand_list {
             if found_flash.is_some() {
                 break;
@@ -1442,11 +1481,23 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                     }
                 }
                 Err(code) if detected_inno_model.is_some() => {
-                    insp.probe_trace
-                        .push(format!("{} 失败 (code={})", label, code));
+                    if (code & 0x10000) != 0 {
+                        insp.probe_trace.push(format!(
+                            "{} 被固件拒绝 (SCSI_STATUS=0x{:02X}，运行态未开放 NAND 指令)",
+                            label,
+                            code & 0xFF
+                        ));
+                    } else {
+                        insp.probe_trace
+                            .push(format!("{} 失败 (win_err={})", label, code));
+                    }
                 }
                 Err(_) => {}
             }
+        }
+
+        if detected_inno_model.is_some() && found_flash.is_none() {
+            innostor_needs_ram_applet = true;
         }
     }
 
@@ -1619,6 +1670,10 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         insp.flash_ce_count = Some(ces);
         insp.probe_status =
             "已通过 ChipGenius v4.21 级底层 SCSI 穿透引擎成功直读主控与物理闪存 Flash ID！".to_string();
+    } else if innostor_needs_ram_applet {
+        insp.probe_status =
+            "已直读银灿主控型号与固件版本！该主控运行态固件默认未开放只读 NAND 指令（ChipGenius 需先强制卸载盘符并向主控 SRAM 临时注入银灿专有 8KB 诊断小程序后才能读出闪存 ID；本软件出于数据安全默认仅执行 100% 无损只读查询）。"
+                .to_string();
     } else if insp.firmware_controller_hint.is_some() {
         insp.probe_status =
             "已通过底层 SCSI 穿透直读到主控型号，但该固件未返回可识别的裸闪存 Flash ID（可展开下方「底层探测诊断明细」查看原始返回字节）。"
@@ -1743,10 +1798,16 @@ mod tests {
         assert_eq!(nand_917[3], 0x00);
         assert_eq!(nand_917[10], 0x04);
 
+        // BCD hex: 0x02, 0x07, 0x18, 0x00 -> "2.07.18.00" (not decimal 2.07.24.00!)
         assert_eq!(
-            parse_innostor_nftl_fw(&[2, 7, 18, 0, 0, 0]).as_deref(),
+            parse_innostor_nftl_fw(&[0x02, 0x07, 0x18, 0x00, 0x81, 0x06]).as_deref(),
             Some("2.07.18.00")
         );
+        // INQU byte 0 = 0xA1 -> "IS902E-A1"
+        let mut inqu_reply = vec![0u8; 128];
+        inqu_reply[0] = 0xA1;
+        inqu_reply[16..22].copy_from_slice(b"IS902E");
+        assert_eq!(parse_innostor_inqu(&inqu_reply).as_deref(), Some("IS902E-A1"));
 
         // Simulate IS902E 512B NAND response with 4CE Intel JS29F16B08HCND1 (89 68 21 A6 A9 00)
         let mut nand_reply = vec![0u8; 512];
