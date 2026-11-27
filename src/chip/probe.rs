@@ -619,6 +619,97 @@ fn parse_hy6919_d3(buf: &[u8]) -> Option<(String, Option<String>)> {
     None
 }
 
+/// Computes smart VID/SCSI-prioritized controller family probe order (1..=16) so the most likely
+/// vendor family is queried FIRST and unrelated families are skipped once firmware confirms the chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+enum ProbeFamily {
+    Yeestor,
+    Smi,
+    Phison,
+    Sss,
+    Ite,
+    ICreate,
+    Is918m,
+    AsolidIs918,
+    Alcor,
+    Chipsbank,
+    FirstChip,
+    InnostorClassic,
+    Micov,
+    Hy6919,
+    Appotech,
+    Skymedi,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn prioritized_probe_families(
+    vid: Option<&str>,
+    scsi_vendor: Option<&str>,
+    controller_hint: Option<&str>,
+) -> Vec<ProbeFamily> {
+    use ProbeFamily::*;
+    let default_order = [
+        Yeestor,
+        Smi,
+        Phison,
+        AsolidIs918,
+        InnostorClassic,
+        Alcor,
+        Chipsbank,
+        FirstChip,
+        Sss,
+        Ite,
+        ICreate,
+        Is918m,
+        Micov,
+        Hy6919,
+        Appotech,
+        Skymedi,
+    ];
+
+    let v = vid.unwrap_or("").to_ascii_uppercase();
+    let sv = scsi_vendor.unwrap_or("").to_ascii_lowercase();
+    let ch = controller_hint.unwrap_or("").to_ascii_lowercase();
+
+    let mut preferred: Vec<ProbeFamily> = Vec::new();
+    if v.ends_with("1F75") || sv.contains("innostor") || ch.contains("innostor") || ch.contains("is9") {
+        preferred.extend_from_slice(&[InnostorClassic, AsolidIs918, Is918m]);
+    } else if v.ends_with("0951") || sv.contains("kingston") {
+        // Kingston DataTraveler commonly uses Phison, SMI, or ASolid/Innostor IS918EN
+        preferred.extend_from_slice(&[AsolidIs918, Phison, Smi, Sss, InnostorClassic]);
+    } else if v.ends_with("13FE") || v.ends_with("0930") || ch.contains("phison") || ch.contains("ps22") {
+        preferred.extend_from_slice(&[Phison, Sss]);
+    } else if v.ends_with("090C") || ch.contains("smi") || ch.contains("sm32") {
+        preferred.extend_from_slice(&[Smi]);
+    } else if v.ends_with("058F") || ch.contains("alcor") || ch.contains("au69") {
+        preferred.extend_from_slice(&[Alcor, AsolidIs918]);
+    } else if v.ends_with("1E3D") || ch.contains("chipsbank") || ch.contains("cbm") {
+        preferred.extend_from_slice(&[Chipsbank]);
+    } else if v.ends_with("048D") || ch.contains("ite") || ch.contains("ut16") {
+        preferred.extend_from_slice(&[Ite]);
+    } else if v.ends_with("1516") || ch.contains("skymedi") || ch.contains("sk62") {
+        preferred.extend_from_slice(&[Skymedi]);
+    } else if v.ends_with("0C76") || ch.contains("sss66") || ch.contains("tc58nc") {
+        preferred.extend_from_slice(&[Sss]);
+    } else if ch.contains("firstchip") || ch.contains("fc11") {
+        preferred.extend_from_slice(&[FirstChip]);
+    } else if ch.contains("yeestor") || ch.contains("silicongo") || ch.contains("sg15") || ch.contains("dm82") {
+        preferred.extend_from_slice(&[Yeestor]);
+    } else if ch.contains("asolid") || ch.contains("as32") {
+        preferred.extend_from_slice(&[AsolidIs918]);
+    } else if ch.contains("micov") || ch.contains("mxt") {
+        preferred.extend_from_slice(&[Micov]);
+    }
+
+    for f in default_order {
+        if !preferred.contains(&f) {
+            preferred.push(f);
+        }
+    }
+    preferred
+}
+
 /// Parses Yeestor / SiliconGo / DM `A1` (36-byte) controller signature response (ChipGenius `0x00483A1A`).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn parse_yeestor_a1(buf: &[u8]) -> Option<String> {
@@ -1346,7 +1437,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                 sense_info_length: 32,
                 data_in: SCSI_IOCTL_DATA_UNSPECIFIED,
                 data_transfer_length: 0,
-                time_out_value: 3,
+                time_out_value: 1,
                 data_buffer: std::ptr::null_mut(),
                 sense_info_offset: sense_off,
                 cdb: [0; 16],
@@ -1390,7 +1481,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                     sense_info_length: 32,
                     data_in: SCSI_IOCTL_DATA_IN,
                     data_transfer_length: out_len as u32,
-                    time_out_value: 4,
+                    time_out_value: 2,
                     data_buffer: aligned.as_mut_slice().as_mut_ptr() as *mut std::ffi::c_void,
                     sense_info_offset: sense_off,
                     cdb: [0; 16],
@@ -1441,7 +1532,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                     sense_info_length: 32,
                     data_in: SCSI_IOCTL_DATA_IN,
                     data_transfer_length: out_len as u32,
-                    time_out_value: 4,
+                    time_out_value: 2,
                     data_buffer_offset: data_off,
                     sense_info_offset: sense_off,
                     cdb: [0; 16],
@@ -1518,10 +1609,37 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     let mut found_flash: Option<([u8; 6], Option<FlashRecord>, usize)> = None;
     let mut innostor_needs_ram_applet = false;
 
-    // =========================================================================
-    // STAGE 1: Exact ChipGenius v4.21 Unconditional Safe Probes (Families 1..8)
-    // =========================================================================
+    let is_usb_or_removable = disk.vid.is_some()
+        || disk.kind.is_external_or_removable()
+        || disk.protocol.to_ascii_uppercase().contains("USB");
 
+    // =========================================================================
+    // Smart VID/SCSI-Prioritized Controller Probing (Families 1..16)
+    // Probes the most likely controller family FIRST and immediately stops once
+    // Flash ID or exact firmware controller signature is confirmed!
+    // =========================================================================
+    let families = if is_usb_or_removable {
+        let ctrl_hint = insp
+            .controller_match
+            .as_ref()
+            .map(|m| format!("{} {}", m.primary.chip_vendor, m.primary.controller));
+        prioritized_probe_families(
+            insp.vid.as_deref(),
+            insp.scsi_vendor.as_deref(),
+            ctrl_hint.as_deref(),
+        )
+    } else {
+        insp.probe_trace
+            .push("非 USB 移动存储设备，跳过 16 族 U 盘主控私有指令探测。".to_string());
+        Vec::new()
+    };
+
+    for family in families {
+        if found_flash.is_some() || insp.firmware_controller_hint.is_some() {
+            break;
+        }
+        match family {
+            ProbeFamily::Yeestor => {
     // ---- 1. Yeestor / SiliconGo / DM (得一微 / 硅格 / 点序: 0x00483A1A) ----
     if let Ok(buf) = send_cdb(&[0xA1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 36, false) {
         if let Some(model) = parse_yeestor_a1(&buf) {
@@ -1544,6 +1662,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::Smi => {
     // ---- 2. Silicon Motion (慧荣 SMI: 0x004300F8) ----
     // Exact ChipGenius order & offsets:
     //   F0 04 -> model at 0x190..0x1AE
@@ -1595,6 +1715,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::Phison => {
     // ---- 3. Phison (群联: 0x004B8332) ----
     // Exact ChipGenius 3-step sequence:
     //   Step A: 06 1D 00 00 41 57 ("AW" wakeup, DATA_UNSPECIFIED=2, 0B)
@@ -1637,6 +1759,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::Sss => {
     // ---- 4. Solid State System (鑫创 SSS: 0x0047C30A) ----
     // Exact ChipGenius v4.21 sequence:
     //   1) FF 02 (12B, 16B) -> buf[0] decodes exact 19-entry SSS6673..SSS6698 / TC58NC66xx model
@@ -1691,6 +1815,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::Ite => {
     // ---- 5. ITE / Usbest (联阳: 0x00457EEE) ----
     // Exact ChipGenius CDBs: 12 00 00 00 B4 00 (6B, 180B), F2 (10B, 34B), FD 10 (10B, 5B), FD 80 ... 06 ... 01 (16B, 64B)!
     if found_flash.is_none() {
@@ -1732,6 +1858,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::ICreate => {
     // ---- 6. iCreate (创惟系: 0x004B2CCF) ----
     // Exact ChipGenius CDBs: 12 00 00 00 4F 00 (6B, 79B), C2 01 90 00 00 00 00 00 80 00 69 BA (12B, 512B)!
     if found_flash.is_none() {
@@ -1752,6 +1880,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::Is918m => {
     // ---- 7. Innostor IS918M (银灿 IS918M: 0x004BA5A3) ----
     // Exact 16-byte CDB with trailing `05 80 F8 FF`!
     if found_flash.is_none() {
@@ -1780,6 +1910,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::AsolidIs918 => {
     // ---- 8. Innostor IS918M_GA / IS918EN (18002) & ASolid (0x004C7601 & 0x00429483) ----
     // Exact 16-byte CDBs with trailing `"AS"` (0x41 0x53)!
     if found_flash.is_none() {
@@ -1932,10 +2064,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
-    // =========================================================================
-    // STAGE 2: Additional ChipGenius v4.21 Controller Families (Families 9..17)
-    // =========================================================================
-
+            }
+            ProbeFamily::Alcor => {
     // ---- 9. Alcor Micro (安国: 0x004503D5) ----
     // Exact ChipGenius sequence: 9A (1-byte CDB, 512B -> 48-entry chip code at buf[4..6]), FA 0E (8B, 512B), FA 00 (8B, 512B -> Flash ID stride 16)!
     if found_flash.is_none() {
@@ -1989,6 +2119,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::Chipsbank => {
     // ---- 10. Chipsbank (芯邦: 0x0044553E) ----
     // Exact ChipGenius CDBs: E3 01 (12B, 128B), EA 01 ... E3 (16B, 1536B), EA 1B 00 01 ... E3 (16B, 4B), E6 00 ... E6 (12B/16B, 128B)!
     if found_flash.is_none() {
@@ -2041,6 +2173,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::FirstChip => {
     // ---- 11. FirstChip (一芯: 0x004BD8AE) ----
     // Exact ChipGenius CDBs: F1 01 ... A0 (magic 1A 2B 3C 4D @ 0x20), F1 00 ... A1 (Flash ID @ 0x10, 0x20, 0x30)!
     if found_flash.is_none() {
@@ -2084,6 +2218,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::InnostorClassic => {
     // ---- 12. Innostor Classic IS902..IS917 (银灿: 0x0045D4F8) ----
     // Exact ChipGenius v4.21 sequence:
     //   1) FC 00 ... 80 00 00 "INQU" (128B) -> exact chip model (IS902/IS902E/IS903/IS916/IS916EN/IS917)
@@ -2218,6 +2354,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::Micov => {
     // ---- 13. Micov / Ameco (迈科微: 0x0044CDE9) ----
     // Exact ChipGenius CDBs: D3 00 (16B, 512B), D6 00 90 08 00 00 01 (16B, 16B — handles 16-bit interleaved Flash ID!)
     if found_flash.is_none() {
@@ -2273,6 +2411,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::Hy6919 => {
     // ---- 14. HY6919 (华义: 0x004C2321) ----
     // Exact ChipGenius read-only CDBs: DF ... D3 (16B, 512B -> controller + FW at 0x21..0x24), DF 00 08 ... D6 (16B, 512B, stride 10)!
     if found_flash.is_none() {
@@ -2313,6 +2453,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::Appotech => {
     // ---- 15. Appotech / Netac / SanDisk (0x004B5FCD) ----
     // Exact ChipGenius CDBs: F5 01 (24B), F5 09 (24B), F5 00 ... 08 ... (256B)!
     if found_flash.is_none() {
@@ -2347,6 +2489,8 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+            ProbeFamily::Skymedi => {
     // ---- 16. Skymedi (擎泰: 0x0046E14A — safe read-only CA/C8 10-byte CDBs) ----
     if found_flash.is_none() {
         let sk_probes: &[(&str, &[u8], bool)] = &[
@@ -2376,16 +2520,22 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
+            }
+        }
+    }
+
     // ---- 17. SAT-16 ATA IDENTIFY DEVICE (USB-SATA / USB-NVMe Bridges & SSD Flash Drives) ----
-    let sat16_identify = [
-        0x85, 0x08, 0x0E, 0x00, 0x00, 0x00, 0x01, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xEC, 0x00,
-    ];
-    if let Ok(ata) = send_cdb(&sat16_identify, 512, false) {
-        if let Some((model, fw)) = parse_ata_identify_model_fw(&ata) {
-            insp.probe_trace
-                .push(format!("SAT-16 ATA IDENTIFY 成功: {} (FW {})", model, fw));
-            insp.bridge_ata_model = Some(format!("{} (FW {})", model, fw));
+    if found_flash.is_none() && insp.firmware_controller_hint.is_none() {
+        let sat16_identify = [
+            0x85, 0x08, 0x0E, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xEC, 0x00,
+        ];
+        if let Ok(ata) = send_cdb(&sat16_identify, 512, false) {
+            if let Some((model, fw)) = parse_ata_identify_model_fw(&ata) {
+                insp.probe_trace
+                    .push(format!("SAT-16 ATA IDENTIFY 成功: {} (FW {})", model, fw));
+                insp.bridge_ata_model = Some(format!("{} (FW {})", model, fw));
+            }
         }
     }
 
@@ -2682,5 +2832,15 @@ mod tests {
         let (_, ga_m, ga_fw) = parse_asolid_is918_ca00(&ga).expect("IS918M_GA");
         assert_eq!(ga_m, "IS918M_GA");
         assert_eq!(ga_fw.as_deref(), Some("13008SE3L_000001"));
+
+        // Smart VID/SCSI-prioritized family ordering
+        let inno_order = prioritized_probe_families(Some("0x3535"), Some("Innostor"), None);
+        assert_eq!(inno_order[0], ProbeFamily::InnostorClassic);
+        assert_eq!(inno_order.len(), 16);
+
+        let kt_order = prioritized_probe_families(Some("0x0951"), Some("Kingston"), None);
+        assert_eq!(kt_order[0], ProbeFamily::AsolidIs918);
+        assert_eq!(kt_order[1], ProbeFamily::Phison);
+        assert_eq!(kt_order.len(), 16);
     }
 }

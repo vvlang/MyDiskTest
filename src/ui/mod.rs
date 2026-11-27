@@ -10,7 +10,9 @@ use crate::engine::report::{format_json_report, format_markdown_report};
 use crate::engine::{spawn_test, LiveTestSnapshot, TestConfig, TestMode};
 use chip_panel::{ChipPanelAction, ChipPanelState};
 use egui::{Color32, CornerRadius, RichText, Stroke};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 pub struct MyDiskTestApp {
@@ -21,9 +23,16 @@ pub struct MyDiskTestApp {
     config: TestConfig,
     /// When true, displays the ChipGenius-style Controller & NAND Flash inspection tab
     chip_view_active: bool,
-    chip_db: ChipDatabase,
+    chip_db: Arc<ChipDatabase>,
     chip_inspection: Option<ChipInspection>,
     chip_panel_state: ChipPanelState,
+    /// Non-blocking background disk scan channel
+    disk_scan_rx: Option<Receiver<(Vec<DiskInfo>, Option<PathBuf>, bool)>>,
+    is_scanning_disks: bool,
+    /// Non-blocking background chip/SCSI probe channel (generation-guarded against stale results)
+    chip_probe_rx: Option<Receiver<(u64, ChipInspection, Option<String>)>>,
+    chip_probe_gen: u64,
+    is_probing_chip: bool,
     /// Active or most recently completed test snapshot
     active_state: Option<Arc<Mutex<LiveTestSnapshot>>>,
     cancel_flag: Option<Arc<AtomicBool>>,
@@ -53,40 +62,109 @@ impl MyDiskTestApp {
                     )
                 });
 
-        let chip_db = ChipDatabase::load_default();
-        let disks = scan_disks();
-        // Auto-select first external/removable disk if present, otherwise first disk
-        let selected_disk = disks
-            .iter()
-            .position(|d| d.kind.is_external_or_removable() && !d.is_system)
-            .or_else(|| if disks.is_empty() { None } else { Some(0) });
+        let chip_db = Arc::new(ChipDatabase::load_default());
 
-        let chip_inspection = selected_disk
-            .and_then(|i| disks.get(i))
-            .map(|d| probe_disk_chip(d, &chip_db));
-
-        Self {
-            disks,
-            selected_disk,
+        let mut app = Self {
+            disks: Vec::new(),
+            selected_disk: None,
             allow_system_disk: false,
             dark_mode: true,
             config: TestConfig::default(),
             chip_view_active: false,
             chip_db,
-            chip_inspection,
+            chip_inspection: None,
             chip_panel_state: ChipPanelState::default(),
+            disk_scan_rx: None,
+            is_scanning_disks: false,
+            chip_probe_rx: None,
+            chip_probe_gen: 0,
+            is_probing_chip: false,
             active_state: None,
             cancel_flag: None,
             logo_texture,
             toast: None,
-        }
+        };
+        // Launch background disk scan immediately so the window opens in <50ms without blocking!
+        app.start_disk_scan(&cc.egui_ctx, None, false);
+        app
     }
 
-    fn reprobe_selected_chip(&mut self) {
-        self.chip_inspection = self
-            .selected_disk
-            .and_then(|i| self.disks.get(i))
-            .map(|d| probe_disk_chip(d, &self.chip_db));
+    fn start_disk_scan(
+        &mut self,
+        ctx: &egui::Context,
+        prev_mount: Option<PathBuf>,
+        show_toast: bool,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.disk_scan_rx = Some(rx);
+        self.is_scanning_disks = true;
+        let egui_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let disks = scan_disks();
+            let _ = tx.send((disks, prev_mount, show_toast));
+            egui_ctx.request_repaint();
+        });
+    }
+
+    fn start_chip_probe(&mut self, ctx: &egui::Context, toast_on_done: Option<String>) {
+        self.chip_probe_gen = self.chip_probe_gen.wrapping_add(1);
+        let gen = self.chip_probe_gen;
+        let Some(disk) = self.selected_disk.and_then(|i| self.disks.get(i)).cloned() else {
+            self.chip_inspection = None;
+            self.is_probing_chip = false;
+            self.chip_probe_rx = None;
+            return;
+        };
+        let db = Arc::clone(&self.chip_db);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.chip_probe_rx = Some(rx);
+        self.is_probing_chip = true;
+        let egui_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let insp = probe_disk_chip(&disk, &db);
+            let _ = tx.send((gen, insp, toast_on_done));
+            egui_ctx.request_repaint();
+        });
+    }
+
+    fn poll_background_tasks(&mut self, ctx: &egui::Context) {
+        let scan_done = self
+            .disk_scan_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        if let Some((disks, prev_mount, show_toast)) = scan_done {
+            self.disk_scan_rx = None;
+            self.is_scanning_disks = false;
+            let count = disks.len();
+            self.disks = disks;
+            self.selected_disk = prev_mount
+                .and_then(|m| self.disks.iter().position(|d| d.mount_point == m))
+                .or_else(|| {
+                    self.disks
+                        .iter()
+                        .position(|d| d.kind.is_external_or_removable() && !d.is_system)
+                })
+                .or_else(|| if self.disks.is_empty() { None } else { Some(0) });
+            if show_toast {
+                self.toast = Some(format!("已刷新，发现 {} 个挂载卷。", count));
+            }
+            self.start_chip_probe(ctx, None);
+        }
+
+        let probe_done = self
+            .chip_probe_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        if let Some((gen, insp, toast_msg)) = probe_done {
+            self.chip_probe_rx = None;
+            if gen == self.chip_probe_gen {
+                self.is_probing_chip = false;
+                self.chip_inspection = Some(insp);
+                if let Some(msg) = toast_msg {
+                    self.toast = Some(msg);
+                }
+            }
+        }
     }
 
     fn is_running(&self) -> bool {
@@ -104,22 +182,12 @@ impl MyDiskTestApp {
             .map(|s| s.clone())
     }
 
-    fn refresh_disks(&mut self) {
+    fn refresh_disks(&mut self, ctx: &egui::Context) {
         let prev_mount = self
             .selected_disk
             .and_then(|i| self.disks.get(i))
             .map(|d| d.mount_point.clone());
-        self.disks = scan_disks();
-        self.selected_disk = prev_mount
-            .and_then(|m| self.disks.iter().position(|d| d.mount_point == m))
-            .or_else(|| {
-                self.disks
-                    .iter()
-                    .position(|d| d.kind.is_external_or_removable() && !d.is_system)
-            })
-            .or_else(|| if self.disks.is_empty() { None } else { Some(0) });
-        self.reprobe_selected_chip();
-        self.toast = Some(format!("已刷新，发现 {} 个挂载卷。", self.disks.len()));
+        self.start_disk_scan(ctx, prev_mount, true);
     }
 
     fn start_test(&mut self, ctx: &egui::Context) {
@@ -195,8 +263,9 @@ impl MyDiskTestApp {
 
 impl eframe::App for MyDiskTestApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_background_tasks(ctx);
         let is_running = self.is_running();
-        if is_running {
+        if is_running || self.is_scanning_disks || self.is_probing_chip {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -222,7 +291,7 @@ impl eframe::App for MyDiskTestApp {
                             .color(Color32::from_rgb(56, 189, 248)),
                     );
                     ui.label(
-                        RichText::new("v1.5.2  •  扩容检测 / 坏块扫描 / HD Tune 错误扫描 / 主控闪存 / 速度基准 / 老化拷机")
+                        RichText::new("v1.6.0  •  扩容检测 / 坏块扫描 / HD Tune 错误扫描 / 主控闪存 / 速度基准 / 老化拷机")
                             .weak()
                             .small(),
                     );
@@ -269,7 +338,7 @@ impl eframe::App for MyDiskTestApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("MyDiskTest Next v1.5.2")
+                        RichText::new("MyDiskTest Next v1.6.0")
                             .small()
                             .weak(),
                     );
@@ -299,13 +368,15 @@ impl eframe::App for MyDiskTestApp {
                     self.selected_disk,
                     self.chip_inspection.as_ref(),
                     is_running,
+                    self.is_scanning_disks,
+                    self.is_probing_chip,
                     &mut self.allow_system_disk,
                 ) {
-                    sidebar::SidebarAction::Refresh => self.refresh_disks(),
+                    sidebar::SidebarAction::Refresh => self.refresh_disks(ctx),
                     sidebar::SidebarAction::SelectDisk(idx) => {
                         self.selected_disk = Some(idx);
                         self.allow_system_disk = false;
-                        self.reprobe_selected_chip();
+                        self.start_chip_probe(ctx, None);
                     }
                     sidebar::SidebarAction::PickCustomFolder => {
                         if let Some(folder) = rfd::FileDialog::new()
@@ -315,7 +386,7 @@ impl eframe::App for MyDiskTestApp {
                             let custom = disk_info_for_custom_path(folder);
                             self.disks.insert(0, custom);
                             self.selected_disk = Some(0);
-                            self.reprobe_selected_chip();
+                            self.start_chip_probe(ctx, None);
                             self.toast = Some("已添加并选中自定义测试目录。".to_string());
                         }
                     }
@@ -343,12 +414,15 @@ impl eframe::App for MyDiskTestApp {
                                 ui,
                                 selected.as_ref(),
                                 self.chip_inspection.as_ref(),
+                                self.is_probing_chip,
                                 &self.chip_db,
                                 &mut self.chip_panel_state,
                             ) {
                                 ChipPanelAction::Reprobe => {
-                                    self.reprobe_selected_chip();
-                                    self.toast = Some("已完成主控与闪存重新探测。".to_string());
+                                    self.start_chip_probe(
+                                        ctx,
+                                        Some("已完成主控与闪存重新探测。".to_string()),
+                                    );
                                 }
                                 ChipPanelAction::ImportWdb => {
                                     if let Some(path) = rfd::FileDialog::new()
@@ -364,9 +438,8 @@ impl eframe::App for MyDiskTestApp {
                                                     new_db.controllers.len(),
                                                     new_db.flashes.len()
                                                 );
-                                                self.chip_db = new_db;
-                                                self.reprobe_selected_chip();
-                                                self.toast = Some(msg);
+                                                self.chip_db = Arc::new(new_db);
+                                                self.start_chip_probe(ctx, Some(msg));
                                             }
                                             Err(e) => {
                                                 self.toast = Some(e);
@@ -378,8 +451,8 @@ impl eframe::App for MyDiskTestApp {
                                     self.toast = Some("已复制 ChipGenius 格式主控闪存报告到剪贴板！".to_string());
                                 }
                                 ChipPanelAction::InnostorDeepProbe(model) => {
-                                    if let (Some(ref disk), Some(ref mut insp)) =
-                                        (&selected, self.chip_inspection.as_mut())
+                                    if let (Some(disk), Some(insp_snapshot)) =
+                                        (selected.clone(), self.chip_inspection.clone())
                                     {
                                         if let Some(path) = rfd::FileDialog::new()
                                             .set_title(format!("选择银灿 {} RAM 诊断固件 (.bin)", model))
@@ -388,17 +461,30 @@ impl eframe::App for MyDiskTestApp {
                                         {
                                             match std::fs::read(&path) {
                                                 Ok(bytes) => {
-                                                    run_innostor_deep_probe(
-                                                        disk,
-                                                        &self.chip_db,
-                                                        &model,
-                                                        &bytes,
-                                                        insp,
-                                                    );
-                                                    self.toast = Some(if insp.flash_id_hex.is_some() {
-                                                        "银灿 RAM 深度探测成功，已读出双通道闪存 ID！".to_string()
-                                                    } else {
-                                                        "已完成银灿 RAM 深度探测，请展开底层诊断明细查看结果。".to_string()
+                                                    self.chip_probe_gen =
+                                                        self.chip_probe_gen.wrapping_add(1);
+                                                    let gen = self.chip_probe_gen;
+                                                    let db = Arc::clone(&self.chip_db);
+                                                    let (tx, rx) = std::sync::mpsc::channel();
+                                                    self.chip_probe_rx = Some(rx);
+                                                    self.is_probing_chip = true;
+                                                    let egui_ctx = ctx.clone();
+                                                    std::thread::spawn(move || {
+                                                        let mut insp = insp_snapshot;
+                                                        run_innostor_deep_probe(
+                                                            &disk,
+                                                            &db,
+                                                            &model,
+                                                            &bytes,
+                                                            &mut insp,
+                                                        );
+                                                        let msg = if insp.flash_id_hex.is_some() {
+                                                            "银灿 RAM 深度探测成功，已读出双通道闪存 ID！".to_string()
+                                                        } else {
+                                                            "已完成银灿 RAM 深度探测，请展开底层诊断明细查看结果。".to_string()
+                                                        };
+                                                        let _ = tx.send((gen, insp, Some(msg)));
+                                                        egui_ctx.request_repaint();
                                                     });
                                                 }
                                                 Err(e) => {
@@ -598,7 +684,9 @@ impl MyDiskTestApp {
 
             if cols[5].add_enabled(!is_running, chip_btn).clicked() {
                 self.chip_view_active = true;
-                self.reprobe_selected_chip();
+                if self.chip_inspection.is_none() && !self.is_probing_chip {
+                    self.start_chip_probe(cols[5].ctx(), None);
+                }
             }
         });
     }

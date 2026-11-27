@@ -15,6 +15,8 @@ pub fn render_sidebar(
     selected_idx: Option<usize>,
     chip_info: Option<&ChipInspection>,
     is_running: bool,
+    is_scanning: bool,
+    is_probing_chip: bool,
     allow_system_disk: &mut bool,
 ) -> SidebarAction {
     let mut action = SidebarAction::None;
@@ -23,12 +25,16 @@ pub fn render_sidebar(
     ui.horizontal(|ui| {
         ui.heading("存储设备");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let refresh_label = if is_scanning { "⏳ 扫描中" } else { "🔄 刷新" };
             if ui
-                .add_enabled(!is_running, egui::Button::new("🔄 刷新"))
-                .on_hover_text("重新扫描已挂载的 U 盘、SD 卡和硬盘")
+                .add_enabled(!is_running && !is_scanning, egui::Button::new(refresh_label))
+                .on_hover_text("重新扫描已挂载的 U 盘、SD 卡和硬盘（后台异步执行不卡界面）")
                 .clicked()
             {
                 action = SidebarAction::Refresh;
+            }
+            if is_scanning {
+                ui.spinner();
             }
         });
     });
@@ -54,7 +60,14 @@ pub fn render_sidebar(
         .max_height(list_height)
         .show(ui, |ui| {
             if disks.is_empty() {
-                ui.weak("未检测到可用存储设备，请插入 U 盘或点击「刷新」。");
+                if is_scanning {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("正在后台扫描存储设备...");
+                    });
+                } else {
+                    ui.weak("未检测到可用存储设备，请插入 U 盘或点击「刷新」。");
+                }
             }
 
             for (idx, disk) in disks.iter().enumerate() {
@@ -182,7 +195,18 @@ pub fn render_sidebar(
                 if let (Some(ref vid), Some(ref pid)) = (&disk.vid, &disk.pid) {
                     kv_row(ui, "VID / PID", &format!("{} / {}", vid, pid));
                 }
-                if let Some(insp) = chip_info {
+                if is_probing_chip {
+                    ui.label(RichText::new("主控探测").small().weak());
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("正在后台探测...")
+                                .small()
+                                .color(Color32::from_rgb(56, 189, 248)),
+                        );
+                    });
+                    ui.end_row();
+                } else if let Some(insp) = chip_info {
                     let ctrl_summary = if let Some(ref fc) = insp.firmware_controller_hint {
                         if let Some(ref fv) = insp.firmware_vendor_hint {
                             Some(format!("{} {}", fv, fc))

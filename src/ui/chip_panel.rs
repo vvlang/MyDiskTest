@@ -35,6 +35,7 @@ pub fn render_chip_panel(
     ui: &mut Ui,
     disk: Option<&DiskInfo>,
     inspection: Option<&ChipInspection>,
+    is_probing: bool,
     db: &ChipDatabase,
     panel_state: &mut ChipPanelState,
 ) -> ChipPanelAction {
@@ -75,14 +76,27 @@ pub fn render_chip_panel(
                             action = ChipPanelAction::CopiedReport;
                         }
                     }
+                    let reprobe_lbl = if is_probing { "⏳ 探测中..." } else { "🔄 重新探测" };
                     if ui
-                        .add_enabled(disk.is_some(), egui::Button::new("🔄 重新探测"))
+                        .add_enabled(disk.is_some() && !is_probing, egui::Button::new(reprobe_lbl))
                         .clicked()
                     {
                         action = ChipPanelAction::Reprobe;
                     }
                 });
             });
+
+            if is_probing {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new("正在后台执行底层 USB 描述符与 SCSI 穿透探测，界面可正常操作...")
+                            .small()
+                            .color(Color32::from_rgb(56, 189, 248)),
+                    );
+                });
+            }
 
             ui.small(
                 RichText::new(format!(
