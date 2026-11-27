@@ -27,6 +27,7 @@ pub enum ChipPanelAction {
     Reprobe,
     ImportWdb,
     CopiedReport,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     InnostorDeepProbe(String),
 }
 

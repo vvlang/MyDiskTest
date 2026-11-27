@@ -398,6 +398,148 @@ fn parse_firstchip_f101(buf: &[u8]) -> Option<String> {
     }
 }
 
+/// Exact 19-entry Solid State System (SSS / Toshiba TC58NC66xx) chip code table
+/// reverse-engineered from ChipGenius v4.21 (`0x0047C760`), decoded from `buf[0]` of `FF 02`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn decode_sss_chip_code(code: u8) -> Option<&'static str> {
+    match code {
+        0x71 => Some("SSS6673"),
+        0x87 => Some("SSS6675"),
+        0x88 => Some("TC58NC6686/SSS6675"),
+        0x91 => Some("SSS6675/SSS6677A"),
+        0xA1 => Some("TC58NC6687/SSS6677"),
+        0xA7 => Some("SSS6677"),
+        0xB0 => Some("TC58NC6688/SSS6690"),
+        0xB1 => Some("SSS6690"),
+        0xB2 => Some("TC58NC6689/SSS6691"),
+        0xB3 => Some("SSS6691"),
+        0xB4 => Some("TC58NC6690/SSS6692"),
+        0xB5 => Some("TC58NC6621/SSS6692"),
+        0xB6 => Some("TC58NC6611/SSS6696"),
+        0xB7 => Some("SSS6697"),
+        0xB9 => Some("SSS6696"),
+        0xBA => Some("TC58NC6623/SSS6698"),
+        0xBB => Some("SSS6698"),
+        0xBD => Some("SSS6695"),
+        0xC0 => Some("SSS6679"),
+        _ => None,
+    }
+}
+
+/// Parses Skymedi `CA` (10-byte CDB, 512-byte response) using exact ChipGenius v4.21 (`0x0046ECAC`)
+/// big-endian 32-bit chip signature at `buf[0..4]` (plus `buf[8]` for `SK6226AA`/`SK6226BA`).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_skymedi_ca(buf: &[u8]) -> Option<String> {
+    if buf.len() >= 4 {
+        let sig = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let exact = match sig {
+            0x16030801 => Some("SK6281AA"),
+            0x16031109 => Some("SK6281AB"),
+            0x28060100 => Some("SK6211AA"),
+            0x28060200 => Some("SK6211BA"),
+            0x28060300 => Some("SK6211BB"),
+            0x28070100 => Some("SK6213AA/SK6215"),
+            0x28070200 => Some("SK6215AA/SK6213"),
+            0x12261102 => {
+                if buf.get(8).copied().unwrap_or(0) != 0 {
+                    Some("SK6226BA")
+                } else {
+                    Some("SK6226AA")
+                }
+            }
+            0x12210782 | 0x12210901 | 0x12211406 | 0x12211494 | 0x12211764 => Some("SK6221"),
+            0x00101006 => Some("SK6216"),
+            0x12270101 => Some("SK6236A"),
+            0x12310806 | 0x12310832 | 0x12310874 => Some("SK6231"),
+            _ => None,
+        };
+        if let Some(m) = exact {
+            return Some(m.to_string());
+        }
+    }
+    extract_ascii_chip_hint(buf, &["SK62", "SKYMEDI"])
+}
+
+/// Parses Chipsbank `EA 01 ... E3` / `E3 01` response using exact ChipGenius v4.21 (`0x004461A6`)
+/// controller tags (`CHIP`, `2092..2199`, and firmware build-date disambiguation).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_chipsbank_info(buf: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(buf);
+    for &(needle, model) in &[
+        ("2098EB", "CBM2098EB(V98EB)"),
+        ("2098A", "CBM2098A(V98A)"),
+        ("2098B", "CBM2098(V98)/CBM2098P(V98P)"),
+        ("2098E", "CBM2098E(V98E)"),
+        ("2098S", "CBM2098S(V98S)"),
+        ("2096D", "CBM2096T(V96T)/CBM2096PT(V96PT)"),
+        ("2096E", "CBM2096E(V96E)"),
+        ("2095C", "CBM2096(V96)/CBM2096P(V96P)"),
+        ("2095S", "CBM2096(V96)/CBM2096S(V96S)"),
+        ("2095", "CBM2095(V89)/CBM2093P(V88P)"),
+        ("2093P", "CBM2093(V88)"),
+        ("2093E", "CBM2093E(V88E)"),
+        ("2093V", "CBM2093(V88)"),
+        ("2092X", "CBM2092(V68)"),
+        ("2092", "CBM2092(V68)"),
+        ("2099A", "CBM2099A"),
+        ("2099E", "CBM2099E"),
+        ("2099X", "CBM2099S"),
+        ("2099S", "CBM2099S"),
+        ("2199A", "CBM2199A"),
+        ("2199S", "CBM2199S"),
+        ("2199X", "CBM2199X"),
+        ("2198A", "CBM2198A"),
+        ("2198X", "CBM2198X"),
+    ] {
+        if text.contains(needle) {
+            return Some(model.to_string());
+        }
+    }
+    if text.contains("209XE") || text.contains("219XE") || text.contains("CHIP") {
+        for &(date_tag, model) in &[
+            ("2012  09  10", "CBM2098EB(V98EB)"),
+            ("2012  12  20", "CBM2098E(V98E)"),
+            ("2013  06  06", "CBM2098S(V98S)"),
+            ("2013  10  15", "CBM2093E(V88E)"),
+            ("2015  04  27", "CBM2099E"),
+            ("2015  05  12", "CBM2099E"),
+            ("2016  03  02", "CBM2099E"),
+            ("2016  10  15", "CBM2099E"),
+            ("2017  05  17", "CBM2199A"),
+            ("2017  10  01", "CBM2199S"),
+            ("2017  12  12", "CBM2199A"),
+        ] {
+            if text.contains(date_tag) {
+                return Some(model.to_string());
+            }
+        }
+    }
+    extract_ascii_chip_hint(buf, &["CBM20", "CBM21", "CBM11"])
+}
+
+/// Parses HY6919 `DF ... D3` (512-byte) response using ChipGenius v4.21 (`0x004C2CB6`)
+/// status/version bytes at `buf[0x21..0x25]` (`0x51..0x54` minus `0x30` buffered SPT header).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_hy6919_d3(buf: &[u8]) -> Option<(String, Option<String>)> {
+    if buf.len() < 0x25 {
+        return None;
+    }
+    let text = String::from_utf8_lossy(buf);
+    if text.contains("HY6919") || text.contains("6919") {
+        let ver_word = u32::from_be_bytes([buf[0x21], buf[0x22], buf[0x23], buf[0x24]]);
+        let fw = if ver_word != 0 && ver_word != 0xFFFF_FFFF {
+            Some(format!(
+                "{:02X}.{:02X}.{:02X}.{:02X}",
+                buf[0x21], buf[0x22], buf[0x23], buf[0x24]
+            ))
+        } else {
+            None
+        };
+        return Some(("HY6919".to_string(), fw));
+    }
+    None
+}
+
 /// Parses Yeestor / SiliconGo / DM `A1` (36-byte) controller signature response (ChipGenius `0x00483A1A`).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn parse_yeestor_a1(buf: &[u8]) -> Option<String> {
@@ -1417,8 +1559,23 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     }
 
     // ---- 4. Solid State System (鑫创 SSS: 0x0047C30A) ----
+    // Exact ChipGenius v4.21 sequence:
+    //   1) FF 02 (12B, 16B) -> buf[0] decodes exact 19-entry SSS6673..SSS6698 / TC58NC66xx model
+    //   2) FF <03|07> 68 (12B, 512B) -> 0x03 for SSS6673 (code=0x71), 0x07 for SSS6675..6698, plus FF 00 68 fallback
     if found_flash.is_none() {
+        let mut sss_chip_code: Option<u8> = None;
         if let Ok(buf) = send_cdb(&[0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16, true) {
+            if let Some(&code) = buf.first() {
+                if let Some(model) = decode_sss_chip_code(code) {
+                    sss_chip_code = Some(code);
+                    insp.probe_trace.push(format!(
+                        "SSS FF 02 命中主控码 0x{:02X} -> {}",
+                        code, model
+                    ));
+                    insp.firmware_vendor_hint = Some("Solid State System (鑫创)".to_string());
+                    insp.firmware_controller_hint = Some(model.to_string());
+                }
+            }
             let _ = try_capture_flash(
                 "SSS FF 02",
                 &buf,
@@ -1430,16 +1587,27 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
             );
         }
         if found_flash.is_none() {
-            if let Ok(buf) = send_cdb(&[0xFF, 0x00, 0x68, 0, 0, 0, 0, 0, 0, 0, 0, 0], 512, true) {
-                let _ = try_capture_flash(
-                    "SSS FF 00 68",
-                    &buf,
-                    &[0, 8, 16],
-                    "Solid State System (鑫创)",
-                    db,
-                    &mut found_flash,
-                    insp,
-                );
+            // Exact ChipGenius v4.21 IIf at 0x0047DB56: 0x03 for SSS6673 (0x71), 0x07 for newer SSS chips
+            let sss_subcmds: &[(&str, u8)] = if sss_chip_code == Some(0x71) {
+                &[("SSS FF 03 68", 0x03), ("SSS FF 07 68", 0x07), ("SSS FF 00 68", 0x00)]
+            } else {
+                &[("SSS FF 07 68", 0x07), ("SSS FF 03 68", 0x03), ("SSS FF 00 68", 0x00)]
+            };
+            for &(label, sub) in sss_subcmds {
+                if let Ok(buf) = send_cdb(&[0xFF, sub, 0x68, 0, 0, 0, 0, 0, 0, 0, 0, 0], 512, true)
+                {
+                    if try_capture_flash(
+                        label,
+                        &buf,
+                        &[0, 8, 16, 32],
+                        "Solid State System (鑫创)",
+                        db,
+                        &mut found_flash,
+                        insp,
+                    ) {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1647,7 +1815,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     }
 
     // ---- 10. Chipsbank (芯邦: 0x0044553E) ----
-    // Exact ChipGenius CDBs: E3 01 (12B, 128B), EA 01 ... E3 (16B, 1536B), E6 00 ... E6 (12B/16B, 128B)!
+    // Exact ChipGenius CDBs: E3 01 (12B, 128B), EA 01 ... E3 (16B, 1536B), EA 1B 00 01 ... E3 (16B, 4B), E6 00 ... E6 (12B/16B, 128B)!
     if found_flash.is_none() {
         let cbm_probes: &[(&str, &[u8], usize, &[usize])] = &[
             (
@@ -1663,6 +1831,12 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
                 &[0, 16, 32, 64, 512, 0x684],
             ),
             (
+                "Chipsbank EA 1B",
+                &[0xEA, 0x1B, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xE3],
+                4,
+                &[0],
+            ),
+            (
                 "Chipsbank E6 00",
                 &[0xE6, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xE6],
                 128,
@@ -1671,9 +1845,9 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         ];
         for &(label, cdb, len, offs) in cbm_probes {
             if let Ok(buf) = send_cdb(cdb, len, true) {
-                if let Some(m) =
-                    extract_ascii_chip_hint(&buf, &["CBM20", "CBM21", "CBM11", "2098", "2099", "2199"])
-                {
+                if let Some(m) = parse_chipsbank_info(&buf) {
+                    insp.probe_trace
+                        .push(format!("{} 命中主控: {}", label, m));
                     insp.firmware_vendor_hint = Some("Chipsbank (芯邦)".to_string());
                     insp.firmware_controller_hint = Some(m);
                 }
@@ -1925,25 +2099,41 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     }
 
     // ---- 14. HY6919 (华义: 0x004C2321) ----
-    // Exact ChipGenius CDBs: DF ... D3 (16B, 512B), DF 00 08 ... D6 (16B, 512B, stride 10)!
+    // Exact ChipGenius read-only CDBs: DF ... D3 (16B, 512B -> controller + FW at 0x21..0x24), DF 00 08 ... D6 (16B, 512B, stride 10)!
     if found_flash.is_none() {
-        let hy_probes: &[(&str, [u8; 16], &[usize])] = &[
-            (
-                "HY6919 DF D3",
-                [0xDF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xD3],
-                &[0, 8, 16],
-            ),
-            (
-                "HY6919 DF D6",
-                [0xDF, 0, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xD6],
-                &[0, 10, 20],
-            ),
-        ];
-        for &(label, cdb, offs) in hy_probes {
-            if let Ok(buf) = send_cdb(&cdb, 512, true) {
-                if try_capture_flash(label, &buf, offs, "HY6919", db, &mut found_flash, insp) {
-                    break;
+        let hy_d3 = [0xDF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xD3];
+        if let Ok(buf) = send_cdb(&hy_d3, 512, true) {
+            if let Some((model, fw)) = parse_hy6919_d3(&buf) {
+                insp.probe_trace
+                    .push(format!("HY6919 DF D3 命中主控: {}", model));
+                insp.firmware_vendor_hint = Some("HY (华义)".to_string());
+                insp.firmware_controller_hint = Some(model);
+                if fw.is_some() {
+                    insp.firmware_version_hint = fw;
                 }
+            }
+            let _ = try_capture_flash(
+                "HY6919 DF D3",
+                &buf,
+                &[0, 8, 16],
+                "HY6919",
+                db,
+                &mut found_flash,
+                insp,
+            );
+        }
+        if found_flash.is_none() {
+            let hy_d6 = [0xDF, 0, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xD6];
+            if let Ok(buf) = send_cdb(&hy_d6, 512, true) {
+                let _ = try_capture_flash(
+                    "HY6919 DF D6",
+                    &buf,
+                    &[0, 10, 20],
+                    "HY6919",
+                    db,
+                    &mut found_flash,
+                    insp,
+                );
             }
         }
     }
@@ -1990,7 +2180,9 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         ];
         for &(label, cdb, buffered) in sk_probes {
             if let Ok(buf) = send_cdb(cdb, 512, buffered) {
-                if let Some(m) = extract_ascii_chip_hint(&buf, &["SK62", "SKYMEDI"]) {
+                if let Some(m) = parse_skymedi_ca(&buf) {
+                    insp.probe_trace
+                        .push(format!("{} 命中主控: {}", label, m));
                     insp.firmware_vendor_hint = Some("Skymedi (擎泰)".to_string());
                     insp.firmware_controller_hint = Some(m);
                 }
@@ -2261,5 +2453,45 @@ mod tests {
             .lookup_controller("0xABCD", "0x1234", None)
             .expect("ABCD:1234 match");
         assert!(abcd.primary.note.contains("扩容"));
+    }
+
+    #[test]
+    fn sss_skymedi_chipsbank_hy6919_decoders_work() {
+        // SSS 19-entry FF 02 chip code table
+        assert_eq!(decode_sss_chip_code(0x71), Some("SSS6673"));
+        assert_eq!(decode_sss_chip_code(0xB0), Some("TC58NC6688/SSS6690"));
+        assert_eq!(decode_sss_chip_code(0xBA), Some("TC58NC6623/SSS6698"));
+        assert_eq!(decode_sss_chip_code(0xBB), Some("SSS6698"));
+        assert_eq!(decode_sss_chip_code(0x00), None);
+
+        // Skymedi CA big-endian 32-bit signature + SK6226AA/BA byte 8
+        let mut sk = vec![0u8; 32];
+        sk[..4].copy_from_slice(&0x16030801u32.to_be_bytes());
+        assert_eq!(parse_skymedi_ca(&sk).as_deref(), Some("SK6281AA"));
+        sk[..4].copy_from_slice(&0x12261102u32.to_be_bytes());
+        sk[8] = 0;
+        assert_eq!(parse_skymedi_ca(&sk).as_deref(), Some("SK6226AA"));
+        sk[8] = 1;
+        assert_eq!(parse_skymedi_ca(&sk).as_deref(), Some("SK6226BA"));
+        sk[..4].copy_from_slice(&0x12310832u32.to_be_bytes());
+        assert_eq!(parse_skymedi_ca(&sk).as_deref(), Some("SK6231"));
+
+        // Chipsbank EA 01 tags & build-date disambiguation
+        assert_eq!(
+            parse_chipsbank_info(b"CHIP2098A_FW").as_deref(),
+            Some("CBM2098A(V98A)")
+        );
+        assert_eq!(
+            parse_chipsbank_info(b"CHIP 209XE 2017  10  01").as_deref(),
+            Some("CBM2199S")
+        );
+
+        // HY6919 DF D3 controller & FW decoder
+        let mut hy = vec![0u8; 64];
+        hy[0..6].copy_from_slice(b"HY6919");
+        hy[0x21..0x25].copy_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        let (m, fw) = parse_hy6919_d3(&hy).expect("HY6919 D3");
+        assert_eq!(m, "HY6919");
+        assert_eq!(fw.as_deref(), Some("01.02.03.04"));
     }
 }
