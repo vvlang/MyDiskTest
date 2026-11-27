@@ -291,6 +291,8 @@ fn parse_usbstor_ven_prod_rev(pnp: &str) -> (Option<String>, Option<String>, Opt
 fn query_windows_disk_metadata() -> HashMap<String, WinDiskMeta> {
     let mut map = HashMap::new();
     let ps_script = r#"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 $ErrorActionPreference = 'SilentlyContinue'
 $out = @()
 Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object {
@@ -346,7 +348,7 @@ $out | ConvertTo-Json -Compress
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let trimmed = stdout.trim();
+    let trimmed = stdout.trim().trim_start_matches('\u{feff}');
     if trimmed.is_empty() {
         return map;
     }

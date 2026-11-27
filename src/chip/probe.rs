@@ -409,6 +409,56 @@ fn deinterleave_micov_d6(buf: &[u8]) -> Option<([u8; 6], [u8; 6])> {
     Some((even, odd))
 }
 
+/// Parses Innostor `FC ... "INQU"` (128-byte) response to extract full model + revision
+/// (e.g., `IS902E-A1`, `IS903-A5`, `IS917-E1`) and classify controller generation.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_innostor_inqu(buf: &[u8]) -> Option<String> {
+    extract_ascii_chip_hint(
+        buf,
+        &[
+            "IS902E", "IS902", "IS903", "IS916EN", "IS916", "IS917", "IS918M", "IS918",
+        ],
+    )
+}
+
+/// Parses Innostor `FC <04|05> FE ... "NFTL"` (16-byte) response for 4-byte firmware version
+/// (e.g. `[2, 7, 18, 0]` -> `"2.07.18.00"`).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_innostor_nftl_fw(buf: &[u8]) -> Option<String> {
+    if buf.len() >= 4 && buf[0] > 0 && buf[0] < 20 && !(buf[1] == 0xFF && buf[2] == 0xFF) {
+        Some(format!("{}.{:02}.{:02}.{:02}", buf[0], buf[1], buf[2], buf[3]))
+    } else {
+        None
+    }
+}
+
+/// Returns the exact ChipGenius v4.21 `(nftl_cdb, nand_cdb)` pair for a given Innostor controller model:
+/// - `IS902 / IS902E / IS916`: `NFTL(CDB[1]=0x04)`, `NAND(CDB[1]=0x04, CDB[3]=0x02, CDB[10]=0x08)`
+/// - `IS903`:                  `NFTL(CDB[1]=0x05)`, `NAND(CDB[1]=0x03, CDB[3]=0x02, CDB[10]=0x04)`
+/// - `IS916EN / IS917`:        `NFTL(CDB[1]=0x05)`, `NAND(CDB[1]=0x03, CDB[3]=0x00, CDB[10]=0x04)`
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn innostor_cdbs_for_model(model: &str) -> ([u8; 16], [u8; 16]) {
+    let up = model.to_ascii_uppercase();
+    let is_916en_or_917 = up.contains("IS916EN") || up.contains("IS917");
+    let is_903 = up.contains("IS903");
+    let is_new_gen = is_903 || is_916en_or_917;
+
+    let nftl_b1 = if is_new_gen { 0x05 } else { 0x04 };
+    let nand_b1 = if is_new_gen { 0x03 } else { 0x04 };
+    let nand_b3 = if is_916en_or_917 { 0x00 } else { 0x02 };
+    let nand_b10 = if is_new_gen { 0x04 } else { 0x08 };
+
+    let nftl = [
+        0xFC, nftl_b1, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, b'N', b'F',
+        b'T', b'L',
+    ];
+    let nand = [
+        0xFC, nand_b1, 0x01, nand_b3, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, nand_b10, 0x05, b'N',
+        b'A', b'N', b'D',
+    ];
+    (nftl, nand)
+}
+
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn extract_ascii_chip_hint(buf: &[u8], prefixes: &[&str]) -> Option<String> {
     let text = String::from_utf8_lossy(buf);
@@ -1308,43 +1358,94 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     }
 
     // ---- 12. Innostor Classic IS902..IS917 (银灿: 0x0045D4F8) ----
-    // Exact ChipGenius CDBs: FC ... "INQU" (128B), FC 00 FE ... "NFTL" (16B), FC 00 01 ... "NAND" (512B)!
+    // Exact ChipGenius v4.21 sequence:
+    //   1) FC 00 ... 80 00 00 "INQU" (128B) -> exact chip model (IS902/IS902E/IS903/IS916/IS916EN/IS917)
+    //   2) FC <04|05> FE ... 06 00 00 "NFTL" (16B) -> 4-byte F/W version (e.g. 2.07.18.00)
+    //   3) FC <04|03> 01 <02|00> ... 02 00 <08|04> 05 "NAND" (512B) -> multi-CE / dual-channel Flash ID table!
     if found_flash.is_none() {
         let inno_inqu = [0xFC, 0x00, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, b'I', b'N', b'Q', b'U'];
+        let mut detected_inno_model: Option<String> = None;
         if let Ok(buf) = send_cdb(&inno_inqu, 128, true) {
-            if let Some(m) = extract_ascii_chip_hint(&buf, &["IS902", "IS903", "IS916", "IS917", "IS918"]) {
+            if let Some(m) = parse_innostor_inqu(&buf) {
                 insp.probe_trace
                     .push(format!("Innostor FC INQU 命中主控: {}", m));
                 insp.firmware_vendor_hint = Some("Innostor (银灿)".to_string());
-                insp.firmware_controller_hint = Some(m);
+                insp.firmware_controller_hint = Some(m.clone());
+                detected_inno_model = Some(m);
             }
         }
-        let inno_nftl = [0xFC, 0x00, 0xFE, 0, 0, 0, 0, 0, 0, 0x06, 0, 0, b'N', b'F', b'T', b'L'];
-        if let Ok(buf) = send_cdb(&inno_nftl, 16, false) {
-            let _ = try_capture_flash(
-                "Innostor FC NFTL",
-                &buf,
-                &[0, 6, 8],
-                "Innostor (银灿)",
-                db,
-                &mut found_flash,
-                insp,
-            );
+
+        // Build exact prioritized (NFTL, NAND) CDB order based on detected chip (or try all 3 generations)
+        let mut nftl_list: Vec<(&str, [u8; 16])> = Vec::new();
+        let mut nand_list: Vec<(&str, [u8; 16])> = Vec::new();
+        if let Some(ref model) = detected_inno_model {
+            let (nftl_exact, nand_exact) = innostor_cdbs_for_model(model);
+            nftl_list.push(("Innostor FC NFTL (精确型号)", nftl_exact));
+            nand_list.push(("Innostor FC NAND (精确型号)", nand_exact));
         }
-        if found_flash.is_none() {
-            let inno_nand = [
-                0xFC, 0x00, 0x01, 0, 0, 0, 0, 0, 0x02, 0, 0, 0x05, b'N', b'A', b'N', b'D',
-            ];
-            if let Ok(buf) = send_cdb(&inno_nand, 512, false) {
-                let _ = try_capture_flash(
-                    "Innostor FC NAND",
-                    &buf,
-                    &[0, 8, 16, 32],
-                    "Innostor (银灿)",
-                    db,
-                    &mut found_flash,
-                    insp,
-                );
+        // Fallback variants in case INQU didn't return ASCII or chip is a hybrid revision
+        let (_, nand_902) = innostor_cdbs_for_model("IS902E");
+        let (_, nand_903) = innostor_cdbs_for_model("IS903");
+        let (_, nand_917) = innostor_cdbs_for_model("IS917");
+        for (lbl, cdb) in [
+            ("Innostor FC NAND (IS902/902E/916)", nand_902),
+            ("Innostor FC NAND (IS903)", nand_903),
+            ("Innostor FC NAND (IS916EN/917)", nand_917),
+        ] {
+            if !nand_list.iter().any(|(_, c)| c == &cdb) {
+                nand_list.push((lbl, cdb));
+            }
+        }
+
+        for &(label, cdb) in &nftl_list {
+            match send_cdb(&cdb, 16, false) {
+                Ok(buf) => {
+                    if let Some(fw) = parse_innostor_nftl_fw(&buf) {
+                        insp.probe_trace
+                            .push(format!("{} 读到固件版本: F/W {}", label, fw));
+                        insp.firmware_version_hint = Some(fw);
+                    }
+                    let _ = try_capture_flash(
+                        label,
+                        &buf,
+                        &[0, 6, 8],
+                        "Innostor (银灿)",
+                        db,
+                        &mut found_flash,
+                        insp,
+                    );
+                }
+                Err(code) if detected_inno_model.is_some() => {
+                    insp.probe_trace
+                        .push(format!("{} 失败 (code={})", label, code));
+                }
+                Err(_) => {}
+            }
+        }
+
+        for &(label, cdb) in &nand_list {
+            if found_flash.is_some() {
+                break;
+            }
+            match send_cdb(&cdb, 512, false) {
+                Ok(buf) => {
+                    if try_capture_flash(
+                        label,
+                        &buf,
+                        &[0, 8, 16, 32, 64],
+                        "Innostor (银灿)",
+                        db,
+                        &mut found_flash,
+                        insp,
+                    ) {
+                        break;
+                    }
+                }
+                Err(code) if detected_inno_model.is_some() => {
+                    insp.probe_trace
+                        .push(format!("{} 失败 (code={})", label, code));
+                }
+                Err(_) => {}
             }
         }
     }
@@ -1618,6 +1719,48 @@ mod tests {
         let d6 = [0x98, 0x00, 0x3A, 0x00, 0x98, 0x00, 0xB3, 0x00, 0x76, 0x00, 0x72, 0x00];
         let (even, _odd) = deinterleave_micov_d6(&d6).expect("micov d6");
         assert_eq!(even, [0x98, 0x3A, 0x98, 0xB3, 0x76, 0x72]);
+    }
+
+    #[test]
+    fn innostor_cdbs_and_intel_slc_flash_match_exact_chipgenius() {
+        let db = ChipDatabase::load_default();
+        // IS902E exact CDBs from ChipGenius v4.21 (0x0045EF5D / 0x0045FAD8 / 0x0045FCFE)
+        let (nftl_902e, nand_902e) = innostor_cdbs_for_model("IS902E-A1");
+        assert_eq!(nftl_902e[1], 0x04);
+        assert_eq!(
+            nand_902e,
+            [0xFC, 0x04, 0x01, 0x02, 0, 0, 0, 0, 0x02, 0, 0x08, 0x05, b'N', b'A', b'N', b'D']
+        );
+
+        let (nftl_903, nand_903) = innostor_cdbs_for_model("IS903");
+        assert_eq!(nftl_903[1], 0x05);
+        assert_eq!(nand_903[1], 0x03);
+        assert_eq!(nand_903[3], 0x02);
+        assert_eq!(nand_903[10], 0x04);
+
+        let (_, nand_917) = innostor_cdbs_for_model("IS917");
+        assert_eq!(nand_917[1], 0x03);
+        assert_eq!(nand_917[3], 0x00);
+        assert_eq!(nand_917[10], 0x04);
+
+        assert_eq!(
+            parse_innostor_nftl_fw(&[2, 7, 18, 0, 0, 0]).as_deref(),
+            Some("2.07.18.00")
+        );
+
+        // Simulate IS902E 512B NAND response with 4CE Intel JS29F16B08HCND1 (89 68 21 A6 A9 00)
+        let mut nand_reply = vec![0u8; 512];
+        for ce in 0..4 {
+            let off = 16 + ce * 16;
+            nand_reply[off..off + 6].copy_from_slice(&[0x89, 0x68, 0x21, 0xA6, 0xA9, 0x00]);
+        }
+        let (fid, rec, ces) =
+            find_wdb_flash_in_payload(&nand_reply, &db, &[0, 8, 16, 32, 64]).expect("Intel SLC");
+        assert_eq!(fid, [0x89, 0x68, 0x21, 0xA6, 0xA9, 0x00]);
+        assert!(rec.manufacturer.contains("Intel"));
+        assert_eq!(rec.flash_type, "SLC-4K");
+        assert!(rec.part_numbers.iter().any(|p| p.contains("JS29F16B08HCND1")));
+        assert_eq!(ces, 4);
     }
 
     #[test]
