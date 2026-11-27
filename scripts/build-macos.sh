@@ -48,9 +48,9 @@ cat > "${STAGE_APP}/Contents/Info.plist" << 'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.3.1</string>
+    <string>1.4.0</string>
     <key>CFBundleVersion</key>
-    <string>8</string>
+    <string>9</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>NSHighResolutionCapable</key>

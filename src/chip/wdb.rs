@@ -196,6 +196,17 @@ impl ChipDatabase {
             }
         }
 
+        // Append supplemental modern 2020-2026 NAND Flash IDs (Kioxia BiCS4/5/6, Micron B27/B47R/N38A,
+        // YMTC X2/X3, Samsung V6/V7, SK Hynix V6/V7, SpecTek) when not already present in Chips.wdb.
+        for rec in supplemental_flashes() {
+            if !by_flash_id.contains_key(&rec.flash_id) {
+                let idx = flashes.len();
+                let fid = rec.flash_id.clone();
+                flashes.push(rec);
+                by_flash_id.insert(fid, idx);
+            }
+        }
+
         if controllers.is_empty() && flashes.is_empty() {
             return Err("未在 Chips.wdb 中解析到有效芯片记录".to_string());
         }
@@ -418,10 +429,12 @@ pub fn nand_manufacturer_name(id: u8) -> &'static str {
         0xC8 => "GigaDevice (兆易创新)",
         0xC2 => "Macronix (旺宏)",
         0xEF => "Winbond (华邦)",
-        0xF8 => "Fidelix / Dosilicon (东芯)",
+        0xF8 | 0xE5 => "Fidelix / DoSilicon (东芯)",
         0x92 => "ESMT (晶豪)",
         0x99 => "MIRA / Powerchip",
-        0xCD => "Powerchip (力晶)",
+        0xCD => "PSMC / Powerchip (力晶)",
+        0x07 => "Renesas (瑞萨)",
+        0xC1 => "Infineon (英飞凌)",
         _ => "Unknown (未知闪存厂商)",
     }
 }
@@ -444,8 +457,50 @@ pub fn is_known_nand_vendor(id: u8) -> bool {
             | 0xC2
             | 0xEF
             | 0xF8
+            | 0xE5
             | 0x92
+            | 0xCD
+            | 0x07
+            | 0xC1
     )
+}
+
+/// Algorithmic fallback decoder for brand-new 2020-2026 6-byte JEDEC/ONFI NAND Flash IDs
+/// not yet present in `Chips.wdb` or `supplemental_flashes()`.
+pub fn decode_flash_id_algorithmic(fid: &[u8; 6]) -> Option<FlashRecord> {
+    if !is_known_nand_vendor(fid[0]) {
+        return None;
+    }
+    let mfg = nand_manufacturer_name(fid[0]).to_string();
+    let is_downgraded = fid[0] == 0xB5;
+    // Standard JEDEC 6-byte NAND ID:
+    //   Byte 2 bits [3:2]: cell level (00=SLC, 01=MLC, 10=TLC, 11=QLC)
+    //   Byte 3 bits [1:0]: page size (modern 3D NAND: 00=4K, 01=8K, 10=16K, 11=32K/16K)
+    let cell_bits = (fid[2] >> 2) & 0x03;
+    let cell = match cell_bits {
+        0 => "SLC",
+        1 => "MLC",
+        2 => "TLC",
+        _ => "QLC",
+    };
+    let page_kb = match fid[3] & 0x03 {
+        0 => "4K",
+        1 => "8K",
+        2 => "16K",
+        _ => "16K/32K",
+    };
+    let flash_id = format!("{:02X}{:02X}{:02X}{:02X}", fid[0], fid[1], fid[2], fid[3]);
+    let full_hex = format!(
+        "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+        fid[0], fid[1], fid[2], fid[3], fid[4], fid[5]
+    );
+    Some(FlashRecord {
+        flash_id,
+        manufacturer: mfg,
+        flash_type: format!("{}-{}", cell, page_kb),
+        part_numbers: vec![format!("JEDEC 实时解析 ({}，库外新款颗粒)", full_hex)],
+        is_downgraded,
+    })
 }
 
 /// Infers controller family from classic USB Mass Storage SCSI Inquiry firmware signatures
@@ -486,8 +541,26 @@ pub fn infer_controller_from_scsi(
     } else if v.contains("INNOSTOR") || p.contains("IS903") || p.contains("IS917") || p.contains("IS918") {
         (
             "Innostor (银灿)",
-            "IS903 / IS917 / IS918 系列",
-            "银灿高速 USB 3.0 主控方案",
+            "IS903 / IS917 / IS918 / IS918M 系列",
+            "银灿高速 USB 3.0/3.1 主控方案",
+        )
+    } else if r == "6.60" || r == "6.70" || r == "6.80" {
+        (
+            "HY / FirstChip 系",
+            "HY6919 系列 (依据 SCSI 6.60/6.70/6.80 特征)",
+            "ChipGenius v4.21 专属 Rev 6.60~6.80 主控特征",
+        )
+    } else if v.contains("SKYMEDI") || r == "8.20" {
+        (
+            "Skymedi (擎泰)",
+            "SK6211 / SK6221 / SK6231 系列",
+            "擎泰 U 盘主控方案",
+        )
+    } else if v.contains("NETAC") || p.contains("ONLYDISK") {
+        (
+            "Netac / Appotech (朗科)",
+            "Netac / Appotech / SMI 定制主控",
+            "朗科 OnlyDisk 零售盘方案",
         )
     } else if v.contains("SANDISK") {
         (
@@ -616,6 +689,15 @@ fn supplemental_controllers() -> Vec<ControllerRecord> {
         ("174C", "2362", "ASMedia (祥硕)", "ASM2362 (USB 3.1 Gen2 NVMe 桥接)", "10Gbps NVMe 桥接主控"),
         ("174C", "2364", "ASMedia (祥硕)", "ASM2364 (USB 3.2 Gen2x2 20Gbps 桥接)", "20Gbps NVMe 桥接主控"),
         ("174C", "2464", "ASMedia (祥硕)", "ASM2464PD (USB4 / Thunderbolt 4 40Gbps)", "40Gbps USB4 旗舰硬盘盒主控"),
+        // ---- Yeestor / SiliconGo / DM / Micov / ITE / Skymedi (from ChipGenius v4.21 dispatcher) ----
+        ("BA57", "0001", "Yeestor / SiliconGo (得一微/硅格)", "SG1580 (DM8233) / SG1581 (DM8235)", "得一微/点序 USB 3.0 主控方案"),
+        ("23A9", "EF18", "Yeestor / SiliconGo (得一微/硅格)", "SG1581 (DM8235) / YS9082", "得一微/硅格 U 盘主控方案"),
+        ("1221", "3234", "Micov / Ameco (迈科微)", "MW8209 / MW8259 / MW8269 / MW8289", "迈科微公版 U 盘主控（常见于廉价/礼品盘，建议核验容量）"),
+        ("1307", "0165", "ITE / Usbest (联阳)", "UT165 / IT1167 / IT1170", "联阳经典 U 盘主控"),
+        ("1307", "1167", "ITE / Usbest (联阳)", "IT1167 / UT167", "联阳 USB 2.0/3.0 主控"),
+        ("13C6", "0000", "Skymedi (擎泰)", "SK6211 / SK6215 / SK6221", "擎泰 U 盘主控"),
+        ("1ADA", "0000", "Skymedi (擎泰)", "SK6221 / SK6231 / SK6236A", "擎泰 USB 3.0 主控"),
+        ("0DD8", "1000", "Netac / Appotech (朗科)", "Netac OnlyDisk 定制主控", "朗科 U 盘主控方案"),
         ("05E3", "0749", "Genesys Logic (创惟)", "GL3224 (USB 3.0 SD/TF 读卡器)", "创惟主流 USB 3.0 读卡器主控"),
         ("05E3", "0751", "Genesys Logic (创惟)", "GL3232S (USB 3.2 SD/TF 读卡器)", "创惟高速读卡器主控"),
     ];
@@ -636,6 +718,74 @@ fn supplemental_controllers() -> Vec<ControllerRecord> {
         .collect()
 }
 
+/// High-volume 2020-2026 3D NAND Flash IDs not present in 2019 `Chips.wdb`
+/// (Kioxia BiCS4/5/6, SanDisk BiCS4/5, Micron B27/B47R/N38A/N48R, YMTC X2/X3, Samsung V6/V7, SK Hynix V6/V7, SpecTek).
+fn supplemental_flashes() -> Vec<FlashRecord> {
+    let entries: &[(&str, &str, &str)] = &[
+        // ---- YMTC (长江存储 Xtacking 2.0 / 3.0) ----
+        ("9BC42849", "TLC-16K", "[1CE]YMTC X2-9060 256Gb (128L 3D TLC)"),
+        ("9BC52849", "TLC-16K", "[2CE]YMTC X2-9060 512Gb (128L 3D TLC)"),
+        ("9BC32849", "TLC-16K", "[1CE]YMTC X2-9060 128Gb (128L 3D TLC)"),
+        ("9BC40849", "TLC-16K", "[1CE]YMTC X1-9050 256Gb (64L 3D TLC)"),
+        ("9BC52949", "TLC-16K", "[1CE]YMTC X3-9070 512Gb (232L 3D TLC)"),
+        ("9BC62949", "TLC-16K", "[1CE]YMTC X3-9070 1Tb (232L 3D TLC)"),
+        ("9BC50949", "QLC-16K", "[1CE]YMTC X3-6070 1Tb (232L 3D QLC)"),
+        // ---- Toshiba / Kioxia (铠侠 BiCS4 / BiCS5 / BiCS6) ----
+        ("983C98B3", "TLC-16K", "[1CE]TH58TFT0T23BA8C / Kioxia BiCS4 256Gb 96L TLC"),
+        ("983E98B3", "TLC-16K", "[1CE]TH58TFT1T23BA8H / Kioxia BiCS4 512Gb 96L TLC"),
+        ("984898B3", "TLC-16K", "[1CE]Kioxia BiCS5 256Gb (112L 3D TLC)"),
+        ("984998B3", "TLC-16K", "[1CE]Kioxia BiCS5 512Gb (112L 3D TLC)"),
+        ("984A98B3", "TLC-16K", "[1CE]Kioxia BiCS5 1Tb (112L 3D TLC)"),
+        ("983E99B3", "QLC-16K", "[1CE]Kioxia BiCS4/5 1Tb 3D QLC"),
+        ("984C98B3", "TLC-16K", "[1CE]Kioxia BiCS6 512Gb/1Tb (162L 3D TLC)"),
+        // ---- SanDisk / WD (闪迪 BiCS4 / BiCS5) ----
+        ("453C98B3", "TLC-16K", "[1CE]SanDisk BiCS4 256Gb (96L 3D TLC)"),
+        ("453E98B3", "TLC-16K", "[1CE]SanDisk BiCS4 512Gb (96L 3D TLC)"),
+        ("454898B3", "TLC-16K", "[1CE]SanDisk BiCS5 256Gb (112L 3D TLC)"),
+        ("454998B3", "TLC-16K", "[1CE]SanDisk BiCS5 512Gb (112L 3D TLC)"),
+        ("454A98B3", "TLC-16K", "[1CE]SanDisk BiCS5 1Tb (112L 3D TLC)"),
+        ("453E99B3", "QLC-16K", "[1CE]SanDisk BiCS4/5 1Tb 3D QLC"),
+        // ---- Micron (美光 B27A / B27B / B47R / N38A / N48R) ----
+        ("2CC30832", "TLC-16K", "[1CE]MT29F256G08EBHAF (Micron B27A 96L TLC)"),
+        ("2CC40832", "TLC-16K", "[1CE]MT29F512G08EBHAF (Micron B27B 96L TLC)"),
+        ("2CC30832", "TLC-16K", "[1CE]Micron B27A 256Gb 96L TLC"),
+        ("2CD30C32", "TLC-16K", "[1CE]Micron B47R 512Gb (176L 3D TLC)"),
+        ("2CD40C32", "TLC-16K", "[1CE]Micron B47R 1Tb (176L 3D TLC)"),
+        ("2CD31C32", "QLC-16K", "[1CE]Micron N38A 1Tb (96L 3D QLC)"),
+        ("2CD31E32", "QLC-16K", "[1CE]Micron N48R 1Tb (176L 3D QLC)"),
+        ("2CC50832", "TLC-16K", "[2CE]Micron B27B 1Tb 96L TLC"),
+        // ---- SpecTek (美光大S降级/白片 B27 / B47R / N38A) ----
+        ("B5C40832", "TLC-16K", "[1CE]SpecTek B27B 512Gb (降级片/大S)"),
+        ("B5D30C32", "TLC-16K", "[1CE]SpecTek B47R 512Gb (降级片/大S)"),
+        ("B5D31C32", "QLC-16K", "[1CE]SpecTek N38A 1Tb QLC (降级片/大S)"),
+        // ---- Samsung (三星 V5 / V6 / V7 3D V-NAND) ----
+        ("EC1E98AF", "TLC-16K", "[1CE]K9AFGY8J5B (Samsung V6 128L TLC)"),
+        ("EC5E98AF", "TLC-16K", "[1CE]K9BFGY8J5B (Samsung V6/V7 512Gb TLC)"),
+        ("EC5E98BF", "TLC-16K", "[1CE]Samsung V7 176L 512Gb TLC"),
+        // ---- SK Hynix (海力士 V5 / V6 / V7 3D NAND) ----
+        ("AD7E280B", "TLC-16K", "[1CE]H25BFT8A1M8R (Hynix V5 96L 512Gb TLC)"),
+        ("AD7E2853", "TLC-16K", "[1CE]H25T2TC88C (Hynix V6 128L 512Gb TLC)"),
+        ("AD892853", "TLC-16K", "[1CE]Hynix V7 176L 512Gb TLC"),
+        // ---- Intel (英特尔 96L / 144L QLC & TLC) ----
+        ("89D3AC32", "QLC-16K", "[1CE]Intel N28A 1Tb (96L 3D QLC)"),
+        ("89D3AE32", "QLC-16K", "[1CE]Intel N38A / 144L 1Tb 3D QLC"),
+    ];
+
+    entries
+        .iter()
+        .map(|(fid, ftype, part)| {
+            let mfg_byte = u8::from_str_radix(&fid[..2], 16).unwrap_or(0);
+            FlashRecord {
+                flash_id: (*fid).to_string(),
+                manufacturer: nand_manufacturer_name(mfg_byte).to_string(),
+                flash_type: (*ftype).to_string(),
+                part_numbers: vec![(*part).to_string()],
+                is_downgraded: mfg_byte == 0xB5,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,7 +795,13 @@ mod tests {
         let db = ChipDatabase::load_default();
         assert_eq!(db.db_date, "2019-12-29");
         assert!(db.controllers.len() >= 596);
-        assert_eq!(db.flashes.len(), 1136);
+        assert!(db.flashes.len() >= 1136);
+
+        // Algorithmic fallback for unlisted 2026 YMTC 3D TLC chip
+        let algo = decode_flash_id_algorithmic(&[0x9B, 0xC9, 0x28, 0x4A, 0x00, 0x00])
+            .expect("YMTC algorithmic decode");
+        assert!(algo.manufacturer.contains("YMTC"));
+        assert_eq!(algo.flash_type, "TLC-16K");
 
         // Controller exact lookup
         let m = db
