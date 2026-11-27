@@ -27,6 +27,7 @@ pub enum ChipPanelAction {
     Reprobe,
     ImportWdb,
     CopiedReport,
+    InnostorDeepProbe(String),
 }
 
 pub fn render_chip_panel(
@@ -127,14 +128,26 @@ pub fn render_chip_panel(
                         .spacing([12.0, 6.0])
                         .show(&mut cols[0], |ui| {
                             row_kv(ui, "目标设备", &d.name);
-                            row_kv(ui, "协议与速率", &d.protocol);
+                            row_kv(ui, "协议版本", &d.protocol);
+                            if let Some(ref spd) = d.link_speed {
+                                row_kv(ui, "当前速度", spd);
+                            }
+                            if let Some(ma) = d.max_power_ma {
+                                row_kv_mono(ui, "电力消耗", &format!("{} mA", ma));
+                            }
                             let vid_pid = match (&insp.vid, &insp.pid) {
                                 (Some(v), Some(p)) => format!("VID = {}   PID = {}", v, p),
                                 _ => "非 USB 设备 / 未读取到 VID & PID".to_string(),
                             };
                             row_kv_mono(ui, "VID / PID", &vid_pid);
                             if let Some(ref bcd) = insp.bcd_device {
-                                row_kv_mono(ui, "设备版本 (bcdDevice)", bcd);
+                                row_kv_mono(ui, "设备修订版 (bcdDevice)", bcd);
+                            }
+                            if let Some(ref um) = d.usb_manufacturer {
+                                row_kv(ui, "设备供应商", um);
+                            }
+                            if let Some(ref up) = d.usb_product {
+                                row_kv(ui, "设备名称", up);
                             }
                             if !d.vendor.is_empty() || !d.model.is_empty() {
                                 row_kv(
@@ -321,6 +334,56 @@ pub fn render_chip_panel(
                             .small()
                             .color(Color32::from_rgb(148, 163, 184)),
                     );
+
+                    if let Some((ref ch0, ref ch1)) = insp.flash_channel_map {
+                        cols[1].add_space(6.0);
+                        cols[1].strong("闪存识别码映射表");
+                        egui::Grid::new("flash_ch_map_grid")
+                            .striped(true)
+                            .num_columns(3)
+                            .spacing([14.0, 3.0])
+                            .show(&mut cols[1], |ui| {
+                                ui.small(RichText::new("CE").weak());
+                                ui.small(RichText::new("[通道 0]").strong());
+                                ui.small(RichText::new("[通道 1]").strong());
+                                ui.end_row();
+                                let rows = ch0.len().max(ch1.len());
+                                for i in 0..rows {
+                                    ui.label(RichText::new(format!("#{}", i)).monospace().small().weak());
+                                    let c0 = ch0.get(i).and_then(|x| x.as_deref()).unwrap_or("------------");
+                                    let c1 = ch1.get(i).and_then(|x| x.as_deref()).unwrap_or("------------");
+                                    ui.label(RichText::new(c0).monospace().small());
+                                    ui.label(RichText::new(c1).monospace().small());
+                                    ui.end_row();
+                                }
+                            });
+                    }
+
+                    #[cfg(target_os = "windows")]
+                    if insp.flash_id_hex.is_none() {
+                        if let Some(ref model) = insp.innostor_deep_probe_model {
+                            cols[1].add_space(6.0);
+                            let deep_btn = egui::Button::new(
+                                RichText::new(format!(
+                                    "⚡ 加载外部银灿固件深度直读闪存 ({})",
+                                    model
+                                ))
+                                .strong()
+                                .color(Color32::WHITE),
+                            )
+                            .fill(Color32::from_rgb(16, 185, 129))
+                            .corner_radius(CornerRadius::same(6));
+                            if cols[1]
+                                .add(deep_btn)
+                                .on_hover_text(
+                                    "选择本地银灿量产工具的 RAM 诊断固件 (.bin)，临时卸载盘符读取双通道 8CE 闪存表后自动恢复（也可将 IS902E.bin 放在程序同目录 innostor/ 下自动加载）",
+                                )
+                                .clicked()
+                            {
+                                action = ChipPanelAction::InnostorDeepProbe(model.clone());
+                            }
+                        }
+                    }
 
                     #[cfg(target_os = "windows")]
                     if insp.needs_windows_admin {

@@ -274,6 +274,9 @@ fn inspect_mount_macos(
         scsi_rev: usb_hw.and_then(|h| h.scsi_rev.clone()),
         serial: usb_hw.and_then(|h| h.serial.clone()),
         link_speed: usb_hw.and_then(|h| h.speed.clone()),
+        max_power_ma: None,
+        usb_manufacturer: usb_hw.and_then(|h| h.manufacturer.clone()),
+        usb_product: usb_hw.and_then(|h| h.product_name.clone()),
     })
 }
 

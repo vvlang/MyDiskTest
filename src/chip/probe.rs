@@ -22,6 +22,8 @@ pub struct ChipInspection {
     pub flash_id_hex: Option<String>,
     /// Active CE channel count detected from multi-CE Flash ID response (e.g. 1, 2, 4)
     pub flash_ce_count: Option<usize>,
+    /// Dual-channel CE Flash ID mapping table (`[通道 0]`, `[通道 1]`, up to 8 slots each)
+    pub flash_channel_map: Option<(Vec<Option<String>>, Vec<Option<String>>)>,
     /// Decoded NAND flash record matched from Chips.wdb or algorithmic JEDEC decoder
     pub flash_record: Option<FlashRecord>,
     /// Fallback NAND manufacturer if byte 0 is recognized
@@ -33,6 +35,9 @@ pub struct ChipInspection {
     /// True on Windows when opening the volume for SCSI pass-through failed due to missing admin rights
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub needs_windows_admin: bool,
+    /// Set on Windows when an Innostor IS902~IS917 controller requires an external RAM applet for Flash ID
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub innostor_deep_probe_model: Option<String>,
 }
 
 impl ChipInspection {
@@ -42,15 +47,26 @@ impl ChipInspection {
         s.push_str(&format!("设备描述: {}\n", disk.name));
         s.push_str(&format!("设备类型: {}\n", disk.kind.label_zh()));
         s.push_str(&format!("协议版本: {}\n", disk.protocol));
+        if let Some(ref spd) = disk.link_speed {
+            s.push_str(&format!("当前速度: {}\n", spd));
+        }
+        if let Some(ma) = disk.max_power_ma {
+            s.push_str(&format!("电力消耗: {}mA\n", ma));
+        }
         s.push_str(&format!("挂载路径: {}\n", disk.mount_point.display()));
         if let (Some(ref vid), Some(ref pid)) = (&self.vid, &self.pid) {
             s.push_str(&format!("设备 ID: VID = {}  PID = {}\n", vid, pid));
         }
         if let Some(ref bcd) = self.bcd_device {
-            s.push_str(&format!("设备版本: {}\n", bcd));
+            s.push_str(&format!("设备修订版: {}\n", bcd));
         }
-        if !disk.vendor.is_empty() {
+        if let Some(ref um) = disk.usb_manufacturer {
+            s.push_str(&format!("设备供应商: {}\n", um));
+        } else if !disk.vendor.is_empty() {
             s.push_str(&format!("设备厂商: {}\n", disk.vendor));
+        }
+        if let Some(ref up) = disk.usb_product {
+            s.push_str(&format!("设备名称: {}\n", up));
         }
         if !disk.model.is_empty() {
             s.push_str(&format!("产品型号: {}\n", disk.model));
@@ -128,6 +144,16 @@ impl ChipInspection {
             s.push_str(&format!("闪存探测状态: {}\n", self.probe_status));
         }
 
+        if let Some((ref ch0, ref ch1)) = self.flash_channel_map {
+            s.push_str("\n闪存识别码映射表\n------------------\n[通道 0]\t[通道 1]\n");
+            let rows = ch0.len().max(ch1.len());
+            for i in 0..rows {
+                let c0 = ch0.get(i).and_then(|x| x.as_deref()).unwrap_or("------------");
+                let c1 = ch1.get(i).and_then(|x| x.as_deref()).unwrap_or("------------");
+                s.push_str(&format!("{}\t{}\n", c0, c1));
+            }
+        }
+
         s
     }
 }
@@ -165,11 +191,13 @@ pub fn probe_disk_chip(disk: &DiskInfo, db: &ChipDatabase) -> ChipInspection {
         bridge_ata_model: None,
         flash_id_hex: None,
         flash_ce_count: None,
+        flash_channel_map: None,
         flash_record: None,
         flash_vendor_fallback: None,
         probe_status: String::new(),
         probe_trace: Vec::new(),
         needs_windows_admin: false,
+        innostor_deep_probe_model: None,
     };
 
     #[cfg(target_os = "windows")]
@@ -463,6 +491,345 @@ fn innostor_cdbs_for_model(model: &str) -> ([u8; 16], [u8; 16]) {
         b'A', b'N', b'D',
     ];
     (nftl, nand)
+}
+
+/// Returns `(sector_count, ledc_cdb, exit_tepf_cdb)` for Innostor RAM-mode deep probe & clean exit.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn innostor_ram_mode_params(model: &str) -> (u8, [u8; 16], [u8; 16]) {
+    let up = model.to_ascii_uppercase();
+    let is_916en_or_917 = up.contains("IS916EN") || up.contains("IS917");
+    let is_903 = up.contains("IS903");
+    let is_new_gen = is_903 || is_916en_or_917;
+
+    let sectors: u8 = if is_new_gen {
+        0x60 // 48 KiB (IS903 / IS916EN / IS917)
+    } else if up.contains("IS902E") || up.contains("IS916") {
+        0x40 // 32 KiB (IS902E / IS916)
+    } else {
+        0x20 // 16 KiB (IS902)
+    };
+
+    let ledc_b10 = if is_916en_or_917 { 0x01 } else { 0x00 };
+    let ledc_b11 = if is_916en_or_917 { 0x02 } else { 0x00 };
+    let ledc = [
+        0xFC, 0x06, 0x00, 0x01, 0, 0, 0, 0, 0, 0, ledc_b10, ledc_b11, b'L', b'E', b'D', b'C',
+    ];
+    let exit_b1 = if is_new_gen { 0x04 } else { 0x03 };
+    let exit_tepf = [
+        0xFC, exit_b1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, b'T', b'E', b'P', b'F',
+    ];
+    (sectors, ledc, exit_tepf)
+}
+
+/// Parses an Innostor 512-byte `NAND` reply into `(primary_fid, record, active_ce_count, ch0_slots, ch1_slots)`.
+/// Supports both 16-byte-per-CE layouts (Ch0 @ 0x00..0x80, Ch1 @ 0x80..0x100 or interleaved even/odd 8-byte slots).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_innostor_nand_channels(
+    buf: &[u8],
+    db: &ChipDatabase,
+) -> Option<([u8; 6], Option<FlashRecord>, usize, Vec<Option<String>>, Vec<Option<String>>)> {
+    let (fid, rec, ces) = find_wdb_flash_in_payload(buf, db, &[0, 8, 16, 32, 64])?;
+    let mut ch0: Vec<Option<String>> = Vec::with_capacity(8);
+    let mut ch1: Vec<Option<String>> = Vec::with_capacity(8);
+    let id4 = &fid[..4];
+
+    // Collect all matching 6-byte occurrences aligned to 8 or 16 bytes across the first 256 bytes
+    let mut hit_offsets = Vec::new();
+    let scan_end = buf.len().min(256).saturating_sub(5);
+    let mut off = 0usize;
+    while off < scan_end {
+        if &buf[off..off + 4] == id4 {
+            hit_offsets.push(off);
+            off += 6;
+        } else {
+            off += 1;
+        }
+    }
+
+    let fmt6 = |o: usize| -> String {
+        format!(
+            "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+            buf[o], buf[o + 1], buf[o + 2], buf[o + 3], buf[o + 4], buf[o + 5]
+        )
+    };
+
+    if hit_offsets.len() >= 2 {
+        // Group into 2 channels (up to 8 slots each) when dual-channel count is even & >= 2
+        let split_dual = hit_offsets.len() % 2 == 0 && hit_offsets.len() >= 2;
+        if split_dual {
+            let per_ch = (hit_offsets.len() / 2).min(8);
+            for i in 0..8 {
+                if i < per_ch {
+                    ch0.push(Some(fmt6(hit_offsets[i])));
+                    ch1.push(Some(fmt6(hit_offsets[per_ch + i])));
+                } else {
+                    ch0.push(None);
+                    ch1.push(None);
+                }
+            }
+            return Some((fid, Some(rec), per_ch, ch0, ch1));
+        }
+    }
+
+    // Single-channel fallback
+    for i in 0..8 {
+        if i < hit_offsets.len() {
+            ch0.push(Some(fmt6(hit_offsets[i])));
+        } else {
+            ch0.push(None);
+        }
+        ch1.push(None);
+    }
+    Some((fid, Some(rec), ces.max(hit_offsets.len()), ch0, ch1))
+}
+
+/// Runs the clean-room Innostor RAM-mode deep Flash ID probe on Windows using a user-supplied
+/// official Innostor MP-tool RAM applet `.bin` file (e.g., `IS902E.bin` / `IN902E.bin`):
+/// `FSCTL_DISMOUNT_VOLUME` -> `FSCTL_LOCK_VOLUME` -> `TEPF` -> `EXEC` (DATA_OUT) -> `NAND` (512B)
+/// -> `LEDC` -> `TEPF (exit)` -> `START STOP UNIT (1B)` -> `FSCTL_UNLOCK_VOLUME`.
+#[cfg(target_os = "windows")]
+pub fn run_innostor_deep_probe(
+    disk: &DiskInfo,
+    db: &ChipDatabase,
+    chip_model: &str,
+    applet_bytes: &[u8],
+    insp: &mut ChipInspection,
+) {
+    use crate::disk::direct_io::AlignedBuffer;
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    const FSCTL_LOCK_VOLUME: u32 = 0x00090018;
+    const FSCTL_UNLOCK_VOLUME: u32 = 0x0009001C;
+    const FSCTL_DISMOUNT_VOLUME: u32 = 0x00090020;
+    const IOCTL_SCSI_PASS_THROUGH_DIRECT: u32 = 0x0004D014;
+    const SCSI_IOCTL_DATA_OUT: u8 = 0;
+    const SCSI_IOCTL_DATA_IN: u8 = 1;
+    const SCSI_IOCTL_DATA_UNSPECIFIED: u8 = 2;
+
+    #[repr(C)]
+    struct Sptd {
+        length: u16,
+        scsi_status: u8,
+        path_id: u8,
+        target_id: u8,
+        lun: u8,
+        cdb_length: u8,
+        sense_info_length: u8,
+        data_in: u8,
+        data_transfer_length: u32,
+        time_out_value: u32,
+        data_buffer: *mut std::ffi::c_void,
+        sense_info_offset: u32,
+        cdb: [u8; 16],
+    }
+
+    #[repr(C)]
+    struct SptdWithSense {
+        sptd: Sptd,
+        sense_buf: [u8; 32],
+    }
+
+    if disk.is_system {
+        insp.probe_trace
+            .push("拒绝在系统盘上执行银灿 RAM 深度探测。".to_string());
+        return;
+    }
+
+    let mut path_candidates = Vec::new();
+    let mount_str = disk.mount_point.to_string_lossy();
+    if mount_str.len() >= 2 && mount_str.as_bytes()[1] == b':' {
+        path_candidates.push(format!(r"\\.\{}:", &mount_str[..1]));
+    }
+    if let Some(ref raw) = disk.raw_disk_path {
+        path_candidates.push(raw.clone());
+    }
+
+    let mut file_opt = None;
+    for p in &path_candidates {
+        if let Ok(f) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(p)
+        {
+            file_opt = Some(f);
+            break;
+        }
+    }
+    let Some(file) = file_opt else {
+        insp.needs_windows_admin = true;
+        insp.probe_trace
+            .push("银灿 RAM 深度探测需要管理员权限打开设备句柄。".to_string());
+        return;
+    };
+    let handle = file.as_raw_handle();
+
+    let send_sptd = |cdb: &[u8], dir: u8, buf: Option<&mut [u8]>| -> bool {
+        let sense_off = std::mem::offset_of!(SptdWithSense, sense_buf) as u32;
+        let (ptr, len) = match buf {
+            Some(b) => (b.as_mut_ptr() as *mut std::ffi::c_void, b.len() as u32),
+            None => (std::ptr::null_mut(), 0),
+        };
+        let mut req = SptdWithSense {
+            sptd: Sptd {
+                length: std::mem::size_of::<Sptd>() as u16,
+                scsi_status: 0,
+                path_id: 0,
+                target_id: 1,
+                lun: 0,
+                cdb_length: cdb.len().min(16) as u8,
+                sense_info_length: 32,
+                data_in: dir,
+                data_transfer_length: len,
+                time_out_value: 10,
+                data_buffer: ptr,
+                sense_info_offset: sense_off,
+                cdb: [0; 16],
+            },
+            sense_buf: [0; 32],
+        };
+        for (i, &b) in cdb.iter().take(16).enumerate() {
+            req.sptd.cdb[i] = b;
+        }
+        let mut ret: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_SCSI_PASS_THROUGH_DIRECT,
+                &mut req as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<SptdWithSense>() as u32,
+                &mut req as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<SptdWithSense>() as u32,
+                &mut ret,
+                std::ptr::null_mut(),
+            )
+        };
+        ok != 0 && req.sptd.scsi_status == 0
+    };
+
+    let fsctl = |code: u32| -> bool {
+        let mut ret: u32 = 0;
+        unsafe {
+            DeviceIoControl(
+                handle,
+                code,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut ret,
+                std::ptr::null_mut(),
+            ) != 0
+        }
+    };
+
+    let (sectors, ledc_cdb, exit_tepf_cdb) = innostor_ram_mode_params(chip_model);
+    let (_, nand_cdb) = innostor_cdbs_for_model(chip_model);
+    let total_bytes = (sectors as usize) * 512;
+
+    if applet_bytes.is_empty() || applet_bytes.len() > total_bytes {
+        insp.probe_trace.push(format!(
+            "外部银灿固件体积不匹配 ({}B，预期 ≤ {}B)",
+            applet_bytes.len(),
+            total_bytes
+        ));
+        return;
+    }
+
+    let _ = fsctl(FSCTL_DISMOUNT_VOLUME);
+    let _ = fsctl(FSCTL_LOCK_VOLUME);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // 1. Enter temporary SRAM mode (TEPF)
+    let enter_tepf = [0xFC, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, b'T', b'E', b'P', b'F'];
+    let tepf_ok = send_sptd(&enter_tepf, SCSI_IOCTL_DATA_UNSPECIFIED, None);
+    insp.probe_trace.push(format!(
+        "银灿 RAM 深度模式 TEPF 进入: {}",
+        if tepf_ok { "成功" } else { "失败" }
+    ));
+
+    if tepf_ok {
+        // 2. Upload RAM diagnostic applet padded to sectors*512 with 0xAA 0x55 trailer (EXEC)
+        let alloc_len = ((total_bytes + 4095) / 4096) * 4096;
+        let mut aligned_out = AlignedBuffer::new(alloc_len);
+        let out_slice = &mut aligned_out.as_mut_slice()[..total_bytes];
+        out_slice.fill(0xFF);
+        out_slice[..applet_bytes.len()].copy_from_slice(applet_bytes);
+        out_slice[total_bytes - 2] = 0xAA;
+        out_slice[total_bytes - 1] = 0x55;
+
+        let exec_cdb = [
+            0xFC, 0x02, 0, 0, 0, 0, 0, 0, sectors, 0, 0, 0, b'E', b'X', b'E', b'C',
+        ];
+        let exec_ok = send_sptd(&exec_cdb, SCSI_IOCTL_DATA_OUT, Some(out_slice));
+        insp.probe_trace.push(format!(
+            "银灿 RAM 固件加载 EXEC ({}B): {}",
+            total_bytes,
+            if exec_ok { "成功" } else { "失败" }
+        ));
+
+        if exec_ok {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            // 3. Query 512-byte dual-channel NAND Flash ID table
+            let mut aligned_in = AlignedBuffer::new(4096);
+            let in_slice = &mut aligned_in.as_mut_slice()[..512];
+            if send_sptd(&nand_cdb, SCSI_IOCTL_DATA_IN, Some(in_slice)) {
+                if let Some((fid, rec_opt, ces, ch0, ch1)) =
+                    parse_innostor_nand_channels(in_slice, db)
+                {
+                    let hex = format!(
+                        "{:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                        fid[0], fid[1], fid[2], fid[3], fid[4], fid[5]
+                    );
+                    insp.flash_id_hex = Some(hex.clone());
+                    insp.flash_ce_count = Some(ces);
+                    insp.flash_channel_map = Some((ch0, ch1));
+                    insp.flash_record = rec_opt
+                        .or_else(|| db.lookup_flash_id(&hex))
+                        .or_else(|| decode_flash_id_algorithmic(&fid));
+                    insp.probe_status =
+                        "已通过银灿 RAM 深度诊断模式成功直读物理闪存 ID 与双通道映射表！".to_string();
+                    insp.probe_trace.push(format!(
+                        "银灿 RAM NAND 命中闪存: {} [{}CE]",
+                        hex, ces
+                    ));
+                } else {
+                    let head: String = in_slice
+                        .iter()
+                        .take(16)
+                        .map(|b| format!("{:02X}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    insp.probe_trace
+                        .push(format!("银灿 RAM NAND 返回 512B (前16B: {})", head));
+                }
+            }
+        }
+
+        // 4. ALWAYS cleanly exit RAM mode back to normal Mass Storage firmware!
+        let _ = send_sptd(&ledc_cdb, SCSI_IOCTL_DATA_IN, None);
+        let _ = send_sptd(&exit_tepf_cdb, SCSI_IOCTL_DATA_UNSPECIFIED, None);
+        let start_unit = [0x1B, 0x00, 0x00, 0x00, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let _ = send_sptd(&start_unit, SCSI_IOCTL_DATA_UNSPECIFIED, None);
+    }
+
+    let _ = fsctl(FSCTL_UNLOCK_VOLUME);
+    drop(file);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn run_innostor_deep_probe(
+    _disk: &DiskInfo,
+    _db: &ChipDatabase,
+    _chip_model: &str,
+    _applet_bytes: &[u8],
+    insp: &mut ChipInspection,
+) {
+    insp.probe_status = "银灿 RAM 深度探测仅支持 Windows 平台。".to_string();
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -1498,6 +1865,7 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
 
         if detected_inno_model.is_some() && found_flash.is_none() {
             innostor_needs_ram_applet = true;
+            insp.innostor_deep_probe_model = detected_inno_model.clone();
         }
     }
 
@@ -1688,6 +2056,31 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
     }
 
     drop(file);
+
+    // If an Innostor IS902~IS917 drive needs a RAM applet AND the user placed `innostor/<CHIP>.bin`
+    // beside the executable, run it automatically!
+    if insp.flash_id_hex.is_none() {
+        if let Some(model) = insp.innostor_deep_probe_model.clone() {
+            let base = model.split('-').next().unwrap_or(&model);
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    let candidates = [
+                        dir.join("innostor").join(format!("{}.bin", base)),
+                        dir.join("innostor").join(format!("IN{}.bin", base.trim_start_matches("IS"))),
+                        dir.join(format!("{}.bin", base)),
+                    ];
+                    for p in candidates {
+                        if let Ok(bytes) = std::fs::read(&p) {
+                            insp.probe_trace
+                                .push(format!("检测到外部银灿固件: {}", p.display()));
+                            run_innostor_deep_probe(disk, db, &model, &bytes, insp);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Decodes ATA IDENTIFY DEVICE 512-byte response: words 27..46 (Model) and words 23..26 (Firmware).
@@ -1822,6 +2215,19 @@ mod tests {
         assert_eq!(rec.flash_type, "SLC-4K");
         assert!(rec.part_numbers.iter().any(|p| p.contains("JS29F16B08HCND1")));
         assert_eq!(ces, 4);
+
+        // Dual-channel 8-slot (2x4CE) Innostor NAND channel map test
+        let mut dual_reply = vec![0u8; 512];
+        for i in 0..8 {
+            let off = i * 16;
+            dual_reply[off..off + 6].copy_from_slice(&[0x89, 0x68, 0x21, 0xA6, 0xA9, 0x00]);
+        }
+        let (_, _, per_ch_ce, ch0, ch1) =
+            parse_innostor_nand_channels(&dual_reply, &db).expect("dual channel map");
+        assert_eq!(per_ch_ce, 4);
+        assert_eq!(ch0[0].as_deref(), Some("896821A6A900"));
+        assert_eq!(ch1[3].as_deref(), Some("896821A6A900"));
+        assert_eq!(ch0[4], None);
     }
 
     #[test]

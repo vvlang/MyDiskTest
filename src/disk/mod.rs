@@ -83,8 +83,17 @@ pub struct DiskInfo {
     pub scsi_rev: Option<String>,
     /// Serial number if available
     pub serial: Option<String>,
-    /// USB link speed description if available
+    /// USB link speed description if available (e.g. "高速 (HighSpeed)", "超高速 (SuperSpeed)")
     pub link_speed: Option<String>,
+    /// USB bus power draw in mA from Configuration Descriptor (e.g. 400)
+    #[serde(default)]
+    pub max_power_ma: Option<u32>,
+    /// USB iManufacturer string descriptor (e.g. "Innostor")
+    #[serde(default)]
+    pub usb_manufacturer: Option<String>,
+    /// USB iProduct string descriptor (e.g. "PenDrive")
+    #[serde(default)]
+    pub usb_product: Option<String>,
 }
 
 impl DiskInfo {
@@ -159,6 +168,9 @@ fn scan_disks_platform() -> Vec<DiskInfo> {
         scsi_rev: None,
         serial: None,
         link_speed: None,
+        max_power_ma: None,
+        usb_manufacturer: None,
+        usb_product: None,
     }]
 }
 
@@ -194,6 +206,9 @@ pub fn disk_info_for_custom_path(path: PathBuf) -> DiskInfo {
         scsi_rev: None,
         serial: None,
         link_speed: None,
+        max_power_ma: None,
+        usb_manufacturer: None,
+        usb_product: None,
     }
 }
 

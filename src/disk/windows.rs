@@ -3,13 +3,17 @@ use crate::disk::{DiskInfo, DriveKind};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use windows_sys::Win32::Storage::FileSystem::{
-    GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
+use windows_sys::Win32::System::IO::DeviceIoControl;
 
 const DRIVE_REMOVABLE: u32 = 2;
 const DRIVE_FIXED: u32 = 3;
@@ -45,6 +49,10 @@ struct WinDiskMeta {
     firmware_version: Option<String>,
     #[serde(rename = "DiskNumber")]
     disk_number: Option<u32>,
+    #[serde(rename = "UsbPortNumber")]
+    usb_port_number: Option<u32>,
+    #[serde(rename = "UsbHubId")]
+    usb_hub_id: Option<String>,
 }
 
 pub fn scan_disks_windows() -> Vec<DiskInfo> {
@@ -141,18 +149,29 @@ pub fn scan_disks_windows() -> Vec<DiskInfo> {
             .map(parse_vid_pid_from_pnp)
             .unwrap_or((None, None));
 
-        // Extract USB bcdDevice (REV_xxxx from USB HardwareId) or SCSI/Disk FirmwareVersion
-        let bcd_device = meta
-            .and_then(|m| {
-                m.usb_hw_id
-                    .as_deref()
-                    .and_then(parse_rev_from_hw_id)
-                    .or_else(|| {
-                        m.firmware_version
-                            .as_deref()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                    })
+        // Query native Windows USB Hub descriptors (USB 3.00 / HighSpeed / MaxPower mA / iManufacturer / iProduct)
+        let hub_desc = meta.and_then(|m| {
+            let hub_id = m.usb_hub_id.as_deref().filter(|s| !s.is_empty())?;
+            let port = m.usb_port_number.filter(|&p| p > 0)?;
+            query_usb_hub_descriptors(hub_id, port)
+        });
+
+        // Extract USB bcdDevice (prefer live USB descriptor "0A00", then HardwareId REV_xxxx, then FirmwareVersion)
+        let bcd_device = hub_desc
+            .as_ref()
+            .and_then(|h| h.bcd_device.clone())
+            .or_else(|| {
+                meta.and_then(|m| {
+                    m.usb_hw_id
+                        .as_deref()
+                        .and_then(parse_rev_from_hw_id)
+                        .or_else(|| {
+                            m.firmware_version
+                                .as_deref()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                        })
+                })
             });
 
         let (scsi_vendor, scsi_product, scsi_rev) = meta
@@ -160,12 +179,25 @@ pub fn scan_disks_windows() -> Vec<DiskInfo> {
             .map(parse_usbstor_ven_prod_rev)
             .unwrap_or((None, None, None));
 
-        let vendor = meta
-            .and_then(|m| m.usb_vendor.clone())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        let vendor = hub_desc
+            .as_ref()
+            .and_then(|h| h.manufacturer.clone())
+            .or_else(|| {
+                meta.and_then(|m| m.usb_vendor.clone())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
             .or_else(|| scsi_vendor.clone())
             .unwrap_or_default();
+
+        let protocol = hub_desc
+            .as_ref()
+            .and_then(|h| h.usb_version.clone())
+            .unwrap_or(bus_type.clone());
+        let link_speed = hub_desc.as_ref().and_then(|h| h.speed_label.clone());
+        let max_power_ma = hub_desc.as_ref().and_then(|h| h.max_power_ma);
+        let usb_manufacturer = hub_desc.as_ref().and_then(|h| h.manufacturer.clone());
+        let usb_product = hub_desc.as_ref().and_then(|h| h.product.clone());
 
         let is_system = format!("{}:", letter).eq_ignore_ascii_case(&sys_drive);
         let bus_upper = bus_type.to_uppercase();
@@ -211,7 +243,7 @@ pub fn scan_disks_windows() -> Vec<DiskInfo> {
             total_bytes,
             free_bytes,
             physical_bytes,
-            protocol: bus_type,
+            protocol,
             kind,
             is_system,
             is_read_only,
@@ -224,7 +256,10 @@ pub fn scan_disks_windows() -> Vec<DiskInfo> {
             scsi_product,
             scsi_rev,
             serial,
-            link_speed: None,
+            link_speed,
+            max_power_ma,
+            usb_manufacturer,
+            usb_product,
         });
     }
 
@@ -304,6 +339,8 @@ Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object {
     $usbPnp = ""
     $usbHw = ""
     $usbVendor = ""
+    $usbPort = 0
+    $usbHub = ""
     if ($pnp) {
         $cur = $pnp
         for ($depth = 0; $depth -lt 4; $depth++) {
@@ -313,6 +350,10 @@ Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object {
                 if ($hwProp -and $hwProp.Data) { $usbHw = ($hwProp.Data -join ';') }
                 $mfgProp = Get-PnpDeviceProperty -InstanceId $cur -KeyName 'DEVPKEY_Device_Manufacturer'
                 if ($mfgProp -and $mfgProp.Data) { $usbVendor = [string]$mfgProp.Data }
+                $addrProp = Get-PnpDeviceProperty -InstanceId $cur -KeyName 'DEVPKEY_Device_Address'
+                if ($addrProp -and $addrProp.Data) { $usbPort = [uint32]$addrProp.Data }
+                $hubProp = Get-PnpDeviceProperty -InstanceId $cur -KeyName 'DEVPKEY_Device_Parent'
+                if ($hubProp -and $hubProp.Data) { $usbHub = [string]$hubProp.Data }
                 break
             }
             $parentProp = Get-PnpDeviceProperty -InstanceId $cur -KeyName 'DEVPKEY_Device_Parent'
@@ -333,6 +374,8 @@ Get-Partition | Where-Object { $_.DriveLetter } | ForEach-Object {
         UsbHwId         = $usbHw
         UsbVendor       = $usbVendor
         FirmwareVersion = if ($wmi) { [string]$wmi.FirmwareRevision } else { [string]$disk.FirmwareVersion }
+        UsbPortNumber   = $usbPort
+        UsbHubId        = $usbHub
     }
 }
 $out | ConvertTo-Json -Compress
@@ -371,4 +414,154 @@ $out | ConvertTo-Json -Compress
     }
 
     map
+}
+
+struct UsbHubDescriptorInfo {
+    usb_version: Option<String>,
+    speed_label: Option<String>,
+    max_power_ma: Option<u32>,
+    bcd_device: Option<String>,
+    manufacturer: Option<String>,
+    product: Option<String>,
+}
+
+/// Reads exact USB 3.0/2.0 protocol version, negotiated link speed, bus power draw (mA),
+/// bcdDevice, and USB iManufacturer / iProduct strings directly from the parent Windows USB Hub
+/// via `IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX` (0x00220448) and
+/// `IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION` (0x00220410) — no admin rights needed!
+fn query_usb_hub_descriptors(hub_instance_id: &str, port_num: u32) -> Option<UsbHubDescriptorInfo> {
+    const IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX: u32 = 0x00220448;
+    const IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION: u32 = 0x00220410;
+
+    let hub_path = format!(
+        r"\\?\{}#{{f18a0e88-c30c-11d0-8815-00a0c906bed8}}",
+        hub_instance_id.replace('\\', "#")
+    );
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&hub_path)
+        .ok()?;
+    let handle = file.as_raw_handle();
+
+    // Packed USB_NODE_CONNECTION_INFORMATION_EX buffer (1024 bytes fits up to 80+ pipes)
+    let mut conn_buf = [0u8; 1024];
+    conn_buf[0..4].copy_from_slice(&port_num.to_le_bytes());
+    let mut bytes_ret: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX,
+            conn_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            conn_buf.len() as u32,
+            conn_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            conn_buf.len() as u32,
+            &mut bytes_ret,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 || bytes_ret < 35 {
+        return None;
+    }
+
+    // Offset 4..22 = USB_DEVICE_DESCRIPTOR (18 bytes), Offset 23 = Speed (u8)
+    let dd = &conn_buf[4..22];
+    let bcd_usb = u16::from_le_bytes([dd[2], dd[3]]);
+    let bcd_dev = u16::from_le_bytes([dd[12], dd[13]]);
+    let i_mfg = dd[14];
+    let i_prod = dd[15];
+    let speed = conn_buf[23];
+
+    let usb_version = if bcd_usb > 0 {
+        let major = (bcd_usb >> 8) & 0xFF;
+        let minor = bcd_usb & 0xFF;
+        Some(format!("USB {:X}.{:02X}", major, minor))
+    } else {
+        None
+    };
+
+    let speed_label = match speed {
+        0 => Some("低速 (LowSpeed 1.5Mbps)".to_string()),
+        1 => Some("全速 (FullSpeed 12Mbps)".to_string()),
+        2 => Some("高速 (HighSpeed 480Mbps)".to_string()),
+        3 => Some("超高速 (SuperSpeed 5Gbps+)".to_string()),
+        _ => None,
+    };
+
+    let bcd_device = Some(format!("{:04X}", bcd_dev));
+
+    // Helper: fetch USB descriptor via IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION (packed 12B header + Data)
+    let get_usb_desc = |desc_type: u8, desc_idx: u8, lang_id: u16| -> Option<Vec<u8>> {
+        let mut req = [0u8; 12 + 256];
+        req[0..4].copy_from_slice(&port_num.to_le_bytes());
+        req[4] = 0x80; // bmRequest
+        req[5] = 0x06; // bRequest = GET_DESCRIPTOR
+        let w_value = ((desc_type as u16) << 8) | (desc_idx as u16);
+        req[6..8].copy_from_slice(&w_value.to_le_bytes());
+        req[8..10].copy_from_slice(&lang_id.to_le_bytes());
+        req[10..12].copy_from_slice(&(256u16).to_le_bytes());
+        let mut ret: u32 = 0;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION,
+                req.as_mut_ptr() as *mut std::ffi::c_void,
+                req.len() as u32,
+                req.as_mut_ptr() as *mut std::ffi::c_void,
+                req.len() as u32,
+                &mut ret,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 && ret > 14 {
+            let data_len = (ret as usize - 12).min(256);
+            Some(req[12..12 + data_len].to_vec())
+        } else {
+            None
+        }
+    };
+
+    let max_power_ma = get_usb_desc(2, 0, 0).and_then(|cfg| {
+        if cfg.len() >= 9 && cfg[1] == 2 {
+            let raw = cfg[8] as u32;
+            let mult = if bcd_usb >= 0x0300 { 8 } else { 2 };
+            Some(raw * mult)
+        } else {
+            None
+        }
+    });
+
+    let read_usb_string = |idx: u8| -> Option<String> {
+        if idx == 0 {
+            return None;
+        }
+        let raw = get_usb_desc(3, idx, 0x0409)?;
+        if raw.len() < 4 || raw[1] != 3 {
+            return None;
+        }
+        let b_len = (raw[0] as usize).min(raw.len());
+        let u16s: Vec<u16> = raw[2..b_len]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let s = String::from_utf16_lossy(&u16s).trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    };
+
+    let manufacturer = read_usb_string(i_mfg);
+    let product = read_usb_string(i_prod);
+
+    Some(UsbHubDescriptorInfo {
+        usb_version,
+        speed_label,
+        max_power_ma,
+        bcd_device,
+        manufacturer,
+        product,
+    })
 }

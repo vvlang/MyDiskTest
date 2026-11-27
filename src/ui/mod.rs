@@ -4,7 +4,7 @@ pub mod results_panel;
 pub mod sidebar;
 pub mod speed_chart;
 
-use crate::chip::{probe_disk_chip, ChipDatabase, ChipInspection};
+use crate::chip::{probe_disk_chip, run_innostor_deep_probe, ChipDatabase, ChipInspection};
 use crate::disk::{disk_info_for_custom_path, scan_disks, DiskInfo};
 use crate::engine::report::{format_json_report, format_markdown_report};
 use crate::engine::{spawn_test, LiveTestSnapshot, TestConfig, TestMode};
@@ -222,7 +222,7 @@ impl eframe::App for MyDiskTestApp {
                             .color(Color32::from_rgb(56, 189, 248)),
                     );
                     ui.label(
-                        RichText::new("v1.4.3  •  扩容检测 / 坏块扫描 / HD Tune 错误扫描 / 主控闪存 / 速度基准 / 老化拷机")
+                        RichText::new("v1.5.0  •  扩容检测 / 坏块扫描 / HD Tune 错误扫描 / 主控闪存 / 速度基准 / 老化拷机")
                             .weak()
                             .small(),
                     );
@@ -269,7 +269,7 @@ impl eframe::App for MyDiskTestApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("MyDiskTest Next v1.4.3")
+                        RichText::new("MyDiskTest Next v1.5.0")
                             .small()
                             .weak(),
                     );
@@ -376,6 +376,37 @@ impl eframe::App for MyDiskTestApp {
                                 }
                                 ChipPanelAction::CopiedReport => {
                                     self.toast = Some("已复制 ChipGenius 格式主控闪存报告到剪贴板！".to_string());
+                                }
+                                ChipPanelAction::InnostorDeepProbe(model) => {
+                                    if let (Some(ref disk), Some(ref mut insp)) =
+                                        (&selected, self.chip_inspection.as_mut())
+                                    {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .set_title(format!("选择银灿 {} RAM 诊断固件 (.bin)", model))
+                                            .add_filter("Innostor RAM Applet", &["bin"])
+                                            .pick_file()
+                                        {
+                                            match std::fs::read(&path) {
+                                                Ok(bytes) => {
+                                                    run_innostor_deep_probe(
+                                                        disk,
+                                                        &self.chip_db,
+                                                        &model,
+                                                        &bytes,
+                                                        insp,
+                                                    );
+                                                    self.toast = Some(if insp.flash_id_hex.is_some() {
+                                                        "银灿 RAM 深度探测成功，已读出双通道闪存 ID！".to_string()
+                                                    } else {
+                                                        "已完成银灿 RAM 深度探测，请展开底层诊断明细查看结果。".to_string()
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    self.toast = Some(format!("读取固件文件失败: {}", e));
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 ChipPanelAction::None => {}
                             }
