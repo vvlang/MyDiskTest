@@ -76,3 +76,9 @@ cargo run --release
 # 打包为绿色单文件 MyDiskTest-Windows.exe
 .\scripts\build-windows.ps1
 ```
+
+## 📄 版权与许可
+
+- **开发者**：AIYeon
+- **版权所有**：Copyright © 2026 AIYeon. All rights reserved.
+- **开源协议**：[MIT License](LICENSE)

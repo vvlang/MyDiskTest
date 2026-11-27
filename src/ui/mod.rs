@@ -222,7 +222,7 @@ impl eframe::App for MyDiskTestApp {
                             .color(Color32::from_rgb(56, 189, 248)),
                     );
                     ui.label(
-                        RichText::new("v1.4.1  •  扩容检测 / 坏块扫描 / HD Tune 错误扫描 / 主控闪存 / 速度基准 / 老化拷机")
+                        RichText::new("v1.4.2  •  扩容检测 / 坏块扫描 / HD Tune 错误扫描 / 主控闪存 / 速度基准 / 老化拷机")
                             .weak()
                             .small(),
                     );
@@ -256,6 +256,29 @@ impl eframe::App for MyDiskTestApp {
                                     .color(Color32::from_rgb(52, 211, 153)),
                             );
                         }
+                    });
+                });
+            });
+
+        // Bottom Copyright Footer Bar
+        egui::TopBottomPanel::bottom("copyright_footer")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(14, 5)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("MyDiskTest Next v1.4.2")
+                            .small()
+                            .weak(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("Copyright © 2026 AIYeon  •  Developed by AIYeon")
+                                .small()
+                                .weak(),
+                        );
                     });
                 });
             });
