@@ -517,6 +517,85 @@ fn parse_chipsbank_info(buf: &[u8]) -> Option<String> {
     extract_ascii_chip_hint(buf, &["CBM20", "CBM21", "CBM11"])
 }
 
+/// Parses ASolid / Innostor `CA 00 ... "AS"` (512-byte) signature response:
+/// - `18002S...` (e.g. `18002SO3T_4A1002`) -> `IS918EN (ASolid 18002)` + F/W version
+/// - `18002B...`                           -> `IS918EN (BootROM)` + F/W version
+/// - `13008B...` / `13008S...`             -> `IS918M_GA (BootROM)` / `IS918M_GA`
+/// - `13002B030_000001` / `13002B030_000004` / `13002...` -> `AS3257ENLT` / `AS3257H` / `AS3257`
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_asolid_is918_ca00(buf: &[u8]) -> Option<(String, String, Option<String>)> {
+    if buf.len() < 6 {
+        return None;
+    }
+    let sig: String = buf
+        .iter()
+        .take(32)
+        .take_while(|&&b| b.is_ascii_graphic() || b == b' ')
+        .map(|&b| b as char)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    let text = String::from_utf8_lossy(buf);
+
+    let fw = if sig.len() >= 6 && sig.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        Some(sig.clone())
+    } else {
+        None
+    };
+
+    if sig.starts_with("18002B") || text.contains("18002B") {
+        return Some((
+            "ASolid / Innostor (点序/银灿)".to_string(),
+            "IS918EN (BootROM)".to_string(),
+            fw,
+        ));
+    }
+    if sig.starts_with("18002") || text.contains("18002S") || text.contains("18002") {
+        return Some((
+            "ASolid / Innostor (点序/银灿)".to_string(),
+            "IS918EN (ASolid 18002)".to_string(),
+            fw,
+        ));
+    }
+    if sig.starts_with("13008B") || text.contains("13008B") {
+        return Some((
+            "Innostor / ASolid (银灿/点序)".to_string(),
+            "IS918M_GA (BootROM)".to_string(),
+            fw,
+        ));
+    }
+    if sig.starts_with("13008") || text.contains("13008S") || text.contains("13008") {
+        return Some((
+            "Innostor / ASolid (银灿/点序)".to_string(),
+            "IS918M_GA".to_string(),
+            fw,
+        ));
+    }
+    if text.contains("13002B030_000001") {
+        return Some(("ASolid (点序)".to_string(), "AS3257ENLT".to_string(), fw));
+    }
+    if text.contains("13002B030_000004") {
+        return Some(("ASolid (点序)".to_string(), "AS3257H".to_string(), fw));
+    }
+    if sig.starts_with("13002") || text.contains("13002") {
+        return Some(("ASolid (点序)".to_string(), "AS3257".to_string(), fw));
+    }
+    // Generic modern ASolid / IS918 5-digit generation prefix (e.g. 1600x, 1900x, 2000x + B/S/M)
+    let b = sig.as_bytes();
+    if b.len() >= 6
+        && matches!(b[0], b'1' | b'2')
+        && b[1..5].iter().all(|c| c.is_ascii_digit())
+        && matches!(b[5], b'S' | b'B' | b'M' | b'C')
+    {
+        return Some((
+            "ASolid / Innostor (点序/银灿)".to_string(),
+            format!("IS918 / ASolid ({})", &sig[..5]),
+            fw,
+        ));
+    }
+    None
+}
+
 /// Parses HY6919 `DF ... D3` (512-byte) response using ChipGenius v4.21 (`0x004C2CB6`)
 /// status/version bytes at `buf[0x21..0x25]` (`0x51..0x54` minus `0x30` buffered SPT header).
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -1701,58 +1780,154 @@ fn probe_windows_scsi_flash(disk: &DiskInfo, db: &ChipDatabase, insp: &mut ChipI
         }
     }
 
-    // ---- 8. Innostor IS918M_GA & ASolid (0x004C7601 & 0x00429483) ----
+    // ---- 8. Innostor IS918M_GA / IS918EN (18002) & ASolid (0x004C7601 & 0x00429483) ----
     // Exact 16-byte CDBs with trailing `"AS"` (0x41 0x53)!
     if found_flash.is_none() {
-        let asolid_probes: &[(&str, [u8; 16], &str)] = &[
+        let mut detected_asolid = false;
+        let asolid_id_probes: &[(&str, [u8; 16])] = &[
             (
-                "IS918M_GA CA 00 AS",
+                "ASolid/IS918 CA 00 AS",
                 [0xCA, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
-                "Innostor / ASolid (银灿/安国系)",
-            ),
-            (
-                "IS918M_GA CA 0F AS",
-                [0xCA, 0x0F, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
-                "Innostor / ASolid (银灿/安国系)",
             ),
             (
                 "ASolid CA 00 06 AS",
                 [0xCA, 0x00, 0, 0, 0, 0, 0x06, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
-                "ASolid (安国一芯系)",
-            ),
-            (
-                "ASolid CA 04 01 AS",
-                [0xCA, 0x04, 0x01, 0x01, 0, 0, 0x06, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
-                "ASolid (安国一芯系)",
             ),
         ];
-        for &(label, cdb, vname) in asolid_probes {
+        for &(label, cdb) in asolid_id_probes {
             if let Ok(buf) = send_cdb(&cdb, 512, true) {
-                let text = String::from_utf8_lossy(&buf);
-                if text.contains("13008B") {
-                    insp.firmware_vendor_hint = Some("Innostor (银灿)".to_string());
-                    insp.firmware_controller_hint = Some("IS918M_GA (BootROM)".to_string());
-                } else if text.contains("13008S") || text.contains("13008") {
-                    insp.firmware_vendor_hint = Some("Innostor (银灿)".to_string());
-                    insp.firmware_controller_hint = Some("IS918M_GA".to_string());
-                } else if text.contains("13002B030_000001") {
-                    insp.firmware_vendor_hint = Some("ASolid".to_string());
-                    insp.firmware_controller_hint = Some("AS3257ENLT".to_string());
-                } else if text.contains("13002B030_000004") {
-                    insp.firmware_vendor_hint = Some("ASolid".to_string());
-                    insp.firmware_controller_hint = Some("AS3257H".to_string());
+                if let Some((vendor, model, fw)) = parse_asolid_is918_ca00(&buf) {
+                    detected_asolid = true;
+                    insp.probe_trace.push(format!(
+                        "{} 命中主控: {} ({})",
+                        label,
+                        model,
+                        fw.as_deref().unwrap_or("-")
+                    ));
+                    insp.firmware_vendor_hint = Some(vendor);
+                    insp.firmware_controller_hint = Some(model);
+                    if fw.is_some() {
+                        insp.firmware_version_hint = fw;
+                    }
+                    // Log bytes 16..48 when non-zero for diagnostics on newer IS918EN builds
+                    if buf.len() >= 48 && buf[16..48].iter().any(|&b| b != 0 && b != 0xFF) {
+                        let ext_hex: String = buf[16..48]
+                            .iter()
+                            .map(|b| format!("{:02X}", b))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        insp.probe_trace
+                            .push(format!("{} 扩展字节[16..48]: {}", label, ext_hex));
+                    }
                 }
                 if try_capture_flash(
                     label,
                     &buf,
-                    &[0, 8, 16, 24],
-                    vname,
+                    &[0, 8, 16, 24, 32, 48, 64],
+                    "ASolid / Innostor (点序/银灿)",
                     db,
                     &mut found_flash,
                     insp,
                 ) {
                     break;
                 }
+                if detected_asolid {
+                    break;
+                }
+            }
+        }
+
+        // Flash ID read-only commands: always try the 2 canonical ChipGenius commands (CA 0F 00 01 & CA 04 01 01),
+        // and when CA 00 confirmed an ASolid/IS918 controller (including 18002 / IS918EN), try full read-only CA variants!
+        let mut asolid_flash_probes: Vec<(&str, [u8; 16])> = vec![
+            (
+                "IS918M_GA CA 0F 00 01 AS",
+                [0xCA, 0x0F, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+            ),
+            (
+                "ASolid CA 04 01 01 06 AS",
+                [0xCA, 0x04, 0x01, 0x01, 0, 0, 0x06, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+            ),
+        ];
+        if detected_asolid {
+            asolid_flash_probes.extend_from_slice(&[
+                (
+                    "ASolid CA 00 01 00 06 AS",
+                    [0xCA, 0x00, 0x01, 0x00, 0, 0, 0x06, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+                ),
+                (
+                    "IS918EN CA 0F 00 00 AS",
+                    [0xCA, 0x0F, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+                ),
+                (
+                    "IS918EN CA 0F 01 00 AS",
+                    [0xCA, 0x0F, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+                ),
+                (
+                    "IS918EN CA 0F 00 01 06 AS",
+                    [0xCA, 0x0F, 0x00, 0x01, 0, 0, 0x06, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+                ),
+                (
+                    "ASolid CA 04 00 01 06 AS",
+                    [0xCA, 0x04, 0x00, 0x01, 0, 0, 0x06, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+                ),
+                (
+                    "ASolid CA 04 00 00 AS",
+                    [0xCA, 0x04, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+                ),
+                (
+                    "IS918EN CA 01 00 00 AS",
+                    [0xCA, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+                ),
+                (
+                    "IS918EN CA 02 00 00 AS",
+                    [0xCA, 0x02, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+                ),
+                (
+                    "IS918EN CA 06 00 00 AS",
+                    [0xCA, 0x06, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+                ),
+                (
+                    "IS918EN CA 07 00 00 AS",
+                    [0xCA, 0x07, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+                ),
+                (
+                    "IS918EN CA 0E 00 00 AS",
+                    [0xCA, 0x0E, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x41, 0x53],
+                ),
+            ]);
+        }
+        for (label, cdb) in asolid_flash_probes {
+            if found_flash.is_some() {
+                break;
+            }
+            match send_cdb(&cdb, 512, true) {
+                Ok(buf) => {
+                    if try_capture_flash(
+                        label,
+                        &buf,
+                        &[0, 8, 16, 24, 32, 48, 64],
+                        "ASolid / Innostor (点序/银灿)",
+                        db,
+                        &mut found_flash,
+                        insp,
+                    ) {
+                        break;
+                    }
+                }
+                Err(code) if detected_asolid => {
+                    if (code & 0x10000) != 0 {
+                        insp.probe_trace.push(format!(
+                            "{} 拒绝 (SCSI_STATUS=0x{:02X})",
+                            label,
+                            code & 0xFF
+                        ));
+                    } else {
+                        insp.probe_trace
+                            .push(format!("{} 失败 (win_err={})", label, code));
+                    }
+                }
+                Err(_) => {}
             }
         }
     }
@@ -2493,5 +2668,19 @@ mod tests {
         let (m, fw) = parse_hy6919_d3(&hy).expect("HY6919 D3");
         assert_eq!(m, "HY6919");
         assert_eq!(fw.as_deref(), Some("01.02.03.04"));
+
+        // Real Kingston DataTraveler 3.0 ASolid / IS918EN (18002SO3T_4A1002) CA 00 response
+        let mut kt = vec![0u8; 512];
+        kt[..16].copy_from_slice(b"18002SO3T_4A1002");
+        let (v, cm, cfw) = parse_asolid_is918_ca00(&kt).expect("IS918EN 18002");
+        assert!(v.contains("ASolid"));
+        assert_eq!(cm, "IS918EN (ASolid 18002)");
+        assert_eq!(cfw.as_deref(), Some("18002SO3T_4A1002"));
+
+        let mut ga = vec![0u8; 64];
+        ga[..16].copy_from_slice(b"13008SE3L_000001");
+        let (_, ga_m, ga_fw) = parse_asolid_is918_ca00(&ga).expect("IS918M_GA");
+        assert_eq!(ga_m, "IS918M_GA");
+        assert_eq!(ga_fw.as_deref(), Some("13008SE3L_000001"));
     }
 }

@@ -663,7 +663,7 @@ fn supplemental_controllers() -> Vec<ControllerRecord> {
         ("0781", "55AE", "SanDisk (闪迪)", "SanDisk Extreme Portable SSD (E61/E81)", "闪迪移动固态硬盘"),
         // ---- Kingston (金士顿) ----
         ("0951", "1665", "Kingston (金士顿)", "DataTraveler 100 G3 (Phison/SMI 方案)", "金士顿零售盘（Windows 管理员下可直读群联/慧荣精确主控）"),
-        ("0951", "1666", "Kingston (金士顿)", "DataTraveler 100 G3 / Exodia (PS2251/SM3281)", "金士顿高频零售盘（常见群联或慧荣方案）"),
+        ("0951", "1666", "Kingston (金士顿)", "DataTraveler 100 G3 / Exodia (PS2251/SM3281/IS918EN)", "金士顿高频零售盘（常见群联、慧荣或银灿/点序 IS918EN 方案）"),
         ("0951", "16A2", "Kingston (金士顿)", "DataTraveler SE9 G2", "金士顿金属盘"),
         ("0951", "16BE", "Kingston (金士顿)", "DataTraveler Micro 3.1", "金士顿迷你 USB 3.1 盘"),
         ("0951", "16D5", "Kingston (金士顿)", "DataTraveler Kyson / Exodia", "金士顿 USB 3.2 零售盘"),

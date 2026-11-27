@@ -222,7 +222,7 @@ impl eframe::App for MyDiskTestApp {
                             .color(Color32::from_rgb(56, 189, 248)),
                     );
                     ui.label(
-                        RichText::new("v1.5.1  •  扩容检测 / 坏块扫描 / HD Tune 错误扫描 / 主控闪存 / 速度基准 / 老化拷机")
+                        RichText::new("v1.5.2  •  扩容检测 / 坏块扫描 / HD Tune 错误扫描 / 主控闪存 / 速度基准 / 老化拷机")
                             .weak()
                             .small(),
                     );
@@ -269,7 +269,7 @@ impl eframe::App for MyDiskTestApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("MyDiskTest Next v1.5.1")
+                        RichText::new("MyDiskTest Next v1.5.2")
                             .small()
                             .weak(),
                     );
